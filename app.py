@@ -20,8 +20,17 @@ app.config.update(
 db.init_db()
 db.ensure_default_users()
 
-LOCAL_DASHBOARD_URL = os.environ.get("LOCAL_DASHBOARD_URL", "http://127.0.0.1:5000")
+DEFAULT_CLIENT_URL = os.environ.get("CLIENT_DASHBOARD_URL") or os.environ.get("LOCAL_DASHBOARD_URL") or "https://quanteye-ai-attendence-production.up.railway.app"
+LOCAL_DASHBOARD_URL = os.environ.get("LOCAL_DASHBOARD_URL", DEFAULT_CLIENT_URL)
 LOCAL_HTTP_TIMEOUT = float(os.environ.get("LOCAL_HTTP_TIMEOUT", "3.0"))
+
+@app.get("/api/config")
+def get_system_config():
+    """Return cloud deployment endpoints and configuration."""
+    return jsonify({
+        "client_dashboard_url": DEFAULT_CLIENT_URL,
+        "main_dashboard_url": os.environ.get("MAIN_DASHBOARD_URL", "https://quanteye-main-dashboard-production.up.railway.app")
+    })
 
 
 # ==============================================================================

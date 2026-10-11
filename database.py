@@ -874,6 +874,7 @@ def update_organization_branding(org_id: str, app_title: str, logo_url: str = ""
 
 def get_all_builds() -> List[Dict[str, Any]]:
     """Retrieve all application builds."""
+    default_cloud_url = os.environ.get("CLIENT_DASHBOARD_URL") or os.environ.get("LOCAL_DASHBOARD_URL") or "https://quanteye-ai-attendence-production.up.railway.app"
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM application_builds ORDER BY created_at DESC")
@@ -885,16 +886,29 @@ def get_all_builds() -> List[Dict[str, Any]]:
                 b['modules'] = json.loads(b.get('modules_snapshot') or '[]')
             except Exception:
                 b['modules'] = []
+            
+            manifest = {}
+            if b.get('download_manifest_json'):
+                try:
+                    manifest = json.loads(b['download_manifest_json'])
+                except Exception:
+                    manifest = {}
+            
             b['organizationId'] = b['organization_id']
             b['organizationName'] = b['organization_name']
             b['branchId'] = b['branch_id']
             b['branchName'] = b['branch_name']
             b['appName'] = b['app_name']
+            b['clientPortalUrl'] = manifest.get('client_portal_url') or default_cloud_url
+            b['clientUsername'] = manifest.get('client_username') or f"admin@{b['organization_name'].lower().replace(' ', '')}.com"
+            b['clientPassword'] = manifest.get('client_password') or "Pass1234!"
+            b['branchKey'] = manifest.get('branch_key') or ""
             builds.append(b)
         return builds
 
 def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a new application build job."""
+    """Create a new application build job with cloud URL and client credentials."""
+    default_cloud_url = os.environ.get("CLIENT_DASHBOARD_URL") or os.environ.get("LOCAL_DASHBOARD_URL") or "https://quanteye-ai-attendence-production.up.railway.app"
     with get_connection() as conn:
         cursor = conn.cursor()
         import json
@@ -909,16 +923,40 @@ def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
         status = data.get('status', 'queued')
         progress = int(data.get('progress', 0) or 0)
 
+        # Query branch token key
+        cursor.execute("SELECT token_key FROM branches WHERE organization_id = ? AND id = ?", (org_id, branch_id))
+        branch_row = cursor.fetchone()
+        branch_key = branch_row['token_key'] if branch_row and branch_row['token_key'] else (data.get('branchKey') or f"QE-{uuid.uuid4().hex[:16].upper()}")
+
+        client_portal_url = data.get('clientPortalUrl') or default_cloud_url
+        client_username = data.get('clientUsername') or data.get('email') or f"admin@{org_name.lower().replace(' ', '')}.com"
+        client_password = data.get('clientPassword') or "Pass1234!"
+
+        manifest_data = {
+            "app_name": app_name,
+            "version": version,
+            "organization_id": org_id,
+            "organization_name": org_name,
+            "branch_id": branch_id,
+            "branch_name": branch_name,
+            "branch_key": branch_key,
+            "client_portal_url": client_portal_url,
+            "client_username": client_username,
+            "client_password": client_password,
+            "modules": modules_list,
+            "created_at": datetime.now().isoformat()
+        }
+
         cursor.execute('''
             INSERT INTO application_builds (id, organization_id, organization_name, branch_id, branch_name,
-                                           app_name, version, modules_snapshot, status, progress, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ''', (build_id, org_id, org_name, branch_id, branch_name, app_name, version, json.dumps(modules_list), status, progress))
+                                           app_name, version, modules_snapshot, status, progress, download_manifest_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ''', (build_id, org_id, org_name, branch_id, branch_name, app_name, version, json.dumps(modules_list), status, progress, json.dumps(manifest_data)))
 
         cursor.execute('''
             INSERT INTO platform_audit_logs (organization_id, branch_id, action, message)
             VALUES (?, ?, 'BUILD_CREATED', ?)
-        ''', (org_id, branch_id, f"Build {version} queued for {org_name} · {branch_name}"))
+        ''', (org_id, branch_id, f"Build {version} queued for {org_name} · {branch_name} (Cloud Portal: {client_portal_url})"))
         conn.commit()
 
     builds = [b for b in get_all_builds() if b['id'] == build_id]

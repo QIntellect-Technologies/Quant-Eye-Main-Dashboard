@@ -303,6 +303,32 @@
     const seedOrgs=[{id:"ORG-001",name:"Demo Organization",industry:"Technology",email:"admin@demo.local",phone:"",address:"",status:"Active",modules:["attendance","employees","leave","reports"],branches:[{name:"Main Branch",city:"",address:"",access:"Active",graceDays:7}],branding:{logo:"",appTitle:"Demo Organization Application"},createdAt:"2026-10-10T08:00:00Z",updatedAt:"2026-10-10T08:00:00Z"}];
     let organizations=[], builds=[], activity=[], invoices=[];
     let currentPage="overview", selectedBuildOrg="", selectedBuildHistoryOrg="";
+    let GLOBAL_CLIENT_URL = "https://quanteye-ai-attendence-production.up.railway.app/";
+    fetch("/api/config").then(r=>r.json()).then(cfg=>{if(cfg&&cfg.client_dashboard_url)GLOBAL_CLIENT_URL=cfg.client_dashboard_url;}).catch(()=>{});
+
+    window.copyToClipboard = function(text, label="Item") {
+      if(!text) return;
+      if(navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(()=>{
+          notify(label + " copied to clipboard!");
+        }).catch(()=>{ fallbackCopy(text, label); });
+      } else {
+        fallbackCopy(text, label);
+      }
+    };
+    function fallbackCopy(text, label) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        notify(label + " copied to clipboard!");
+      } catch(e) {
+        notify("Please copy manually.", true);
+      }
+      document.body.removeChild(ta);
+    }
     function load(key,fallback){try{const value=JSON.parse(localStorage.getItem(key));return value??fallback}catch{return fallback}}
     function save(){/* Legacy no-op: persistence handled via backend APIs */}
     async function reloadData(){
@@ -695,40 +721,133 @@
     function openBuildForm(id="",branchId=""){
       selectedBuildOrg=id;const org=organizations.find(item=>item.id===id);
       if(!org||org.status!=="Active"){notify("Choose an active organization before creating a branch build.",true);return}
-      openModal(`<h2><i class="fa-solid fa-gears" style="color:#3d9fd4"></i> Create Branch Build</h2><form id="buildForm"><input type="hidden" name="organizationId" value="${esc(org.id)}"><div class="build-target-organization"><small>ORGANIZATION</small><strong>${esc(org.name)}</strong></div><div class="form-group"><label for="buildFormBranch">Branch *</label><select class="form-control" id="buildFormBranch" name="branchId" required>${buildBranchOptions(org,branchId)}</select></div><div class="form-group"><label for="buildFormAppName">Application name *</label><input class="form-control" id="buildFormAppName" name="appName" value="QIntellect Application" required maxlength="80"></div><div id="buildSummary" class="summary">Choose the branch for this build.</div><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" id="startBuildButton" type="submit" disabled><i class="fa-solid fa-play"></i> Build Application</button></div></form>`);
+      const defaultUser = org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`;
+      const defaultPass = "Pass1234!";
+      const cloudUrl = GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
+
+      openModal(`
+        <h2><i class="fa-solid fa-gears" style="color:#3d9fd4"></i> Create Branch Build & Generate Client Portal</h2>
+        <form id="buildForm">
+          <input type="hidden" name="organizationId" value="${esc(org.id)}">
+          <div class="build-target-organization">
+            <small>TARGET CLIENT ORGANIZATION</small>
+            <strong>${esc(org.name)}</strong>
+          </div>
+          
+          <div class="form-group" style="margin-top:12px;">
+            <label for="buildFormBranch">Select Branch *</label>
+            <select class="form-control" id="buildFormBranch" name="branchId" required>${buildBranchOptions(org,branchId)}</select>
+          </div>
+
+          <div class="form-group">
+            <label for="buildFormAppName">Application Name *</label>
+            <input class="form-control" id="buildFormAppName" name="appName" value="${esc(org.name)} Attendance Portal" required maxlength="80">
+          </div>
+
+          <div style="background:#f0f9ff; border:1px solid #b9e6fe; border-radius:10px; padding:14px; margin-bottom:14px;">
+            <h4 style="margin:0 0 8px; font-size:0.9rem; font-weight:800; color:#0369a1;">
+              <i class="fa-solid fa-cloud" style="margin-right:6px;"></i> Cloud Deployment & Client Access Settings
+            </h4>
+            
+            <div class="form-group" style="margin-bottom:8px;">
+              <label for="buildFormPortalUrl" style="font-size:0.8rem; font-weight:700; color:#475569;">Client Cloud Portal Link *</label>
+              <input class="form-control" id="buildFormPortalUrl" name="clientPortalUrl" value="${esc(cloudUrl)}" required>
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+              <div>
+                <label for="buildFormUser" style="font-size:0.8rem; font-weight:700; color:#475569;">Client Login Username / Email *</label>
+                <input class="form-control" id="buildFormUser" name="clientUsername" value="${esc(defaultUser)}" required>
+              </div>
+              <div>
+                <label for="buildFormPass" style="font-size:0.8rem; font-weight:700; color:#475569;">Client Password *</label>
+                <input class="form-control" id="buildFormPass" name="clientPassword" value="${esc(defaultPass)}" required>
+              </div>
+            </div>
+          </div>
+
+          <div id="buildSummary" class="summary">Choose an active branch for this build.</div>
+
+          <div class="form-actions">
+            <button type="button" class="btn-outline" data-action="close">Cancel</button>
+            <button class="btn-primary" id="startBuildButton" type="submit" disabled><i class="fa-solid fa-play"></i> Build Application</button>
+          </div>
+        </form>
+      `);
+
       const branchSelect=document.getElementById("buildFormBranch");
       const update=()=>{
         const branch=org.branches.find(item=>item.id===branchSelect.value),appName=document.getElementById("buildFormAppName").value.trim()||"QIntellect Application";
         document.getElementById("startBuildButton").disabled=!branch||effectiveBranchAccess(org,branch)!=="Active";
-        document.getElementById("buildSummary").innerHTML=branch?`<strong>Build target:</strong> ${esc(org.name)} · ${esc(branch.name)}<br><strong>Included modules:</strong> ${org.modules.map(moduleName).map(esc).join(", ")}<br><strong>Next version:</strong> ${esc(nextBuildVersion(org.id,branch.id,appName))}`:`Choose an active branch for ${esc(org.name)}.`;
+        document.getElementById("buildSummary").innerHTML=branch?`<strong>Build target:</strong> ${esc(org.name)} · ${esc(branch.name)}<br><strong>Enabled modules:</strong> ${org.modules.map(moduleName).map(esc).join(", ")}<br><strong>Build version:</strong> ${esc(nextBuildVersion(org.id,branch.id,appName))}`:`Choose an active branch for ${esc(org.name)}.`;
       };
-      branchSelect.addEventListener("change",update);document.getElementById("buildFormAppName").addEventListener("input",update);update();document.getElementById("buildForm").addEventListener("submit",startBuild)
+      branchSelect.addEventListener("change",update);
+      document.getElementById("buildFormAppName").addEventListener("input",update);
+      update();
+      document.getElementById("buildForm").addEventListener("submit",startBuild);
     }
-    function nextBuildVersion(organizationId,branchId,appName){const versions=builds.filter(build=>build.organizationId===organizationId&&(build.branchId||"")===(branchId||"")&&String(build.appName||"").toLowerCase()===appName.toLowerCase()).map(build=>buildVersionNumber(build.version));const patch=versions.reduce((max,version)=>Math.max(max,version[0]===1&&version[1]===0?version[2]:0),0)+1;return `v1.0.${patch}`}
+
+    function nextBuildVersion(organizationId,branchId,appName){
+      const versions=builds.filter(build=>build.organizationId===organizationId&&(build.branchId||"")===(branchId||"")&&String(build.appName||"").toLowerCase()===appName.toLowerCase()).map(build=>buildVersionNumber(build.version));
+      const patch=versions.reduce((max,version)=>Math.max(max,version[0]===1&&version[1]===0?version[2]:0),0)+1;
+      return `v1.0.${patch}`;
+    }
+
     async function startBuild(event){
-      event.preventDefault();const form=new FormData(event.target),org=organizations.find(item=>item.id===form.get("organizationId")),targetValue=String(form.get("branchId")||""),branch=org&&org.branches.find(item=>item.id===targetValue),appName=String(form.get("appName")||"").trim();
+      event.preventDefault();
+      const form=new FormData(event.target);
+      const org=organizations.find(item=>item.id===form.get("organizationId"));
+      const targetValue=String(form.get("branchId")||"");
+      const branch=org&&org.branches.find(item=>item.id===targetValue);
+      const appName=String(form.get("appName")||"").trim();
+      const clientPortalUrl=String(form.get("clientPortalUrl")||GLOBAL_CLIENT_URL).trim();
+      const clientUsername=String(form.get("clientUsername")||"").trim();
+      const clientPassword=String(form.get("clientPassword")||"Pass1234!").trim();
+
       if(!org||org.status!=="Active"){notify("Choose an active organization first.",true);return}
       if(!branch){notify("Choose a branch for this build.",true);return}
       if(effectiveBranchAccess(org,branch)!=="Active"){notify("Choose an active branch before starting a build.",true);return}
       if(!appName){notify("Enter an application name.",true);return}
-      const build={id:`BUILD-${String(Date.now()).slice(-8)}`,organizationId:org.id,organizationName:org.name,branchId:branch.id,branchName:branch.name,appName,version:nextBuildVersion(org.id,branch.id,appName),modules:org.modules.slice(),status:"queued",progress:0,createdAt:new Date().toISOString()};
+
+      const build={
+        id:`BUILD-${String(Date.now()).slice(-8)}`,
+        organizationId:org.id,
+        organizationName:org.name,
+        branchId:branch.id,
+        branchName:branch.name,
+        appName,
+        version:nextBuildVersion(org.id,branch.id,appName),
+        modules:org.modules.slice(),
+        clientPortalUrl,
+        clientUsername,
+        clientPassword,
+        status:"queued",
+        progress:0,
+        createdAt:new Date().toISOString()
+      };
+
       try{
         await fetch("/api/builds",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(build)});
         record(`Build ${build.version} queued for ${org.name} · ${branch.name}`,org.id,branch.id);
         await reloadData();
         closeModal();
         showPage("organization-build-history");
-        notify("Branch build queued. Progress is simulated for testing.");
+        notify("Branch build queued. Building application and cloud credentials...");
+        
         const timer=setInterval(async()=>{
           const current=builds.find(item=>item.id===build.id);
           if(!current){clearInterval(timer);return}
           current.status=current.progress<20?"queued":"building";
-          current.progress=Math.min(100,current.progress+Math.floor(Math.random()*20)+8);
+          current.progress=Math.min(100,current.progress+Math.floor(Math.random()*25)+15);
+          
           if(current.progress>=100){
             current.status="succeeded";
             record(`Build ${current.version} completed for ${org.name} · ${branch.name}`,org.id,branch.id);
-            notify("Build completed successfully.");
+            notify("Build completed! Cloud portal & credentials generated.");
             clearInterval(timer);
+            setTimeout(()=>{
+              openBuildDetails(current.id);
+            }, 500);
           }
           await fetch(`/api/builds/${encodeURIComponent(current.id)}`,{
             method:"PUT",
@@ -736,66 +855,137 @@
             body:JSON.stringify({status:current.status,progress:current.progress})
           }).catch(()=>{});
           render();
-        },650);
+        },550);
       }catch(err){
         notify("Failed to queue build: "+err.message,true);
       }
     }
-    function downloadMock(id){const build=builds.find(item=>item.id===id);if(!build||build.status!=="succeeded")return;const manifest={notice:"Frontend demo artifact; not an executable.",build:{...build,organizationName:build.organizationName||"Removed organization",branchName:build.branchName||"Branch not assigned"},downloadedAt:new Date().toISOString()};const blob=new Blob([JSON.stringify(manifest,null,2)],{type:"application/json"});const link=document.createElement("a");link.href=URL.createObjectURL(blob);link.download=`${build.appName.replace(/[^\w-]+/g,"-")}-${build.version}-${build.id}.json`;link.click();URL.revokeObjectURL(link.href);notify("Demo build manifest downloaded.")}
+
+    function downloadMock(id){
+      const build=builds.find(item=>item.id===id);
+      if(!build||build.status!=="succeeded")return;
+      const manifest={
+        notice:"QIntellect Application Deployment Manifest",
+        build:{
+          ...build,
+          organizationName:build.organizationName||"Removed organization",
+          branchName:build.branchName||"Branch not assigned"
+        },
+        downloadedAt:new Date().toISOString()
+      };
+      const blob=new Blob([JSON.stringify(manifest,null,2)],{type:"application/json"});
+      const link=document.createElement("a");
+      link.href=URL.createObjectURL(blob);
+      link.download=`${build.appName.replace(/[^\w-]+/g,"-")}-${build.version}-${build.id}.json`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      notify("Client deployment manifest downloaded.");
+    }
+
     function buildHistoryRows(history){
       if(!history.length)return '<div class="empty">No build versions are recorded for this scope yet.</div>';
-      return `<div class="build-history-list">${history.map(build=>`<article class="build-history-item"><div class="build-history-version">${esc(build.version||"Version unavailable")}<small>${esc(build.id)}</small></div><div class="build-history-app"><strong>${esc(build.appName)}</strong><small>${esc(build.branchName||"Branch not assigned")} · ${build.createdAt?date(build.createdAt):"Date unavailable"}</small><small>${build.modules.length} module${build.modules.length===1?"":"s"}</small></div><div>${statusBadge(build.status)}<small class="build-history-progress">${Math.max(0,Math.min(100,Number(build.progress)||0))}%</small></div><div class="build-history-actions"><button class="btn-outline" data-action="buildDetails" data-id="${esc(build.id)}">Details</button>${build.status==="succeeded"?`<button class="btn-outline" data-action="download" data-id="${esc(build.id)}">Manifest</button>`:""}<button class="btn-danger" data-action="delete-build" data-id="${esc(build.id)}" aria-label="Delete build ${esc(build.id)}"><i class="fa-solid fa-trash"></i></button></div></article>`).join("")}</div>`
+      return `<div class="build-history-list">${history.map(build=>`<article class="build-history-item"><div class="build-history-version">${esc(build.version||"Version unavailable")}<small>${esc(build.id)}</small></div><div class="build-history-app"><strong>${esc(build.appName)}</strong><small>${esc(build.branchName||"Branch not assigned")} · ${build.createdAt?date(build.createdAt):"Date unavailable"}</small><small>${build.modules.length} module${build.modules.length===1?"":"s"}</small></div><div>${statusBadge(build.status)}<small class="build-history-progress">${Math.max(0,Math.min(100,Number(build.progress)||0))}%</small></div><div class="build-history-actions"><button class="btn-outline" data-action="buildDetails" data-id="${esc(build.id)}"><i class="fa-solid fa-key"></i> Credentials</button>${build.status==="succeeded"?`<button class="btn-outline" data-action="download" data-id="${esc(build.id)}"><i class="fa-solid fa-file-arrow-down"></i> Manifest</button>`:""}<button class="btn-danger" data-action="delete-build" data-id="${esc(build.id)}" aria-label="Delete build ${esc(build.id)}"><i class="fa-solid fa-trash"></i></button></div></article>`).join("")}</div>`
     }
+
     function openOrganizationBuildHistory(orgId,branchId=""){
       const org=organizations.find(item=>item.id===orgId),historicalName=builds.find(build=>build.organizationId===orgId)?.organizationName||"Removed organization";
       if(!org){const history=builds.filter(build=>build.organizationId===orgId);openModal(`<h2><i class="fa-solid fa-clock-rotate-left" style="color:#3d9fd4"></i> ${esc(historicalName)} · Build history</h2><div class="summary">This organization was removed. Its build history is preserved as a historical record.</div>${buildHistoryRows(history.slice().sort((a,b)=>compareBuildVersions(a,b)||((Date.parse(b.createdAt)||0)-(Date.parse(a.createdAt)||0))))}<div class="form-actions"><button class="btn-outline" data-action="close">Close</button></div>`);return}
       selectedBuildHistoryOrg=org.id;document.getElementById("buildSearch").value="";document.getElementById("buildFilter").value="all";document.getElementById("buildBranchFilter").value=branchId||"all";document.getElementById("buildSort").value="created-desc";showPage("organization-build-history")
     }
+
     function openBuildDetails(id){
       const build=builds.find(item=>item.id===id);if(!build)return;
       const org=organizations.find(item=>item.id===build.organizationId);
       const branch=org&&org.branches.find(b=>b.id===build.branchId);
-      const branchKey = (branch&&branch.tokenKey)||(org&&org.tokenKey)||"QE-9A5DDEE7B01A41C18B2F";
-      const clientUrl = "http://127.0.0.1:5000";
-      const defaultUser = org ? (org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`) : "admin@client.com";
-      const defaultPass = "Pass1234!";
+      const branchKey = (branch&&branch.tokenKey)||(build&&build.branchKey)||(org&&org.tokenKey)||"QE-9A5DDEE7B01A41C18B2F";
+      const clientUrl = build.clientPortalUrl || GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
+      const defaultUser = build.clientUsername || (org ? (org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`) : "admin@client.com");
+      const defaultPass = build.clientPassword || "Pass1234!";
+
+      const handoverText = `🚀 QINTELLECT CLIENT PORTAL & AI NODE CREDENTIALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏢 Organization: ${org?org.name:build.organizationName}
+🏬 Branch: ${build.branchName||"Main Branch"}
+📦 Application Version: ${build.version||"v1.0.1"}
+
+🌐 Client Cloud Portal Link:
+${clientUrl}
+
+👤 Client Login Username / Email:
+${defaultUser}
+
+🔑 Client Login Password:
+${defaultPass}
+
+📹 Standalone AI CCTV Branch Key:
+${branchKey}
+
+⚡ Purchased Modules:
+${(build.modules||[]).map(moduleName).join(", ")}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+© 2026 QIntellect Technologies`;
 
       openModal(`
-        <h2><i class="fa-solid fa-rocket" style="color:#3d9fd4"></i> Client Application & Credentials</h2>
-        <p><strong>${esc(org?org.name:build.organizationName)}</strong> · ${esc(build.branchName||"Main Branch")}</p>
+        <h2><i class="fa-solid fa-rocket" style="color:#3d9fd4"></i> Client Application & Cloud Credentials</h2>
+        <p style="color:#475569; margin-top:-4px;"><strong>${esc(org?org.name:build.organizationName)}</strong> · ${esc(build.branchName||"Main Branch")}</p>
         
-        <div class="build-detail-grid" style="margin-bottom:18px;">
-          <div><small>Application Version</small><strong>${esc(build.version||"v1.0.0")}</strong></div>
+        <div class="build-detail-grid" style="margin-bottom:16px;">
+          <div><small>Application Version</small><strong>${esc(build.version||"v1.0.1")}</strong></div>
           <div><small>Build Status</small><strong>${statusBadge(build.status)}</strong></div>
-          <div><small>Branch Key</small><strong class="mono" style="color:#3d9fd4;font-size:0.85rem;">${esc(branchKey)}</strong></div>
-          <div><small>Client Portal Link</small><strong><a href="${clientUrl}" target="_blank" style="color:#0284c7;text-decoration:underline;">${clientUrl}</a></strong></div>
-        </div>
-
-        <div style="background:#f8fafc; border:1px solid #dbe5ec; border-radius:12px; padding:16px; margin-bottom:18px;">
-          <h4 style="margin:0 0 10px; font-size:0.95rem; font-weight:800; color:#173042;">
-            <i class="fa-solid fa-key" style="color:#3d9fd4; margin-right:6px;"></i> Client Login Credentials
-          </h4>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:8px;">
-            <div>
-              <small style="color:#64748b; font-weight:700;">Client Username / Email:</small>
-              <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; margin-top:4px;">${esc(defaultUser)}</div>
-            </div>
-            <div>
-              <small style="color:#64748b; font-weight:700;">Client Password:</small>
-              <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; margin-top:4px;">${esc(defaultPass)}</div>
+          <div>
+            <small>Branch Key (AI Node)</small>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <strong class="mono" style="color:#3d9fd4;font-size:0.85rem;">${esc(branchKey)}</strong>
+              <button type="button" class="btn-outline" style="padding:2px 6px; font-size:0.75rem;" onclick="copyToClipboard('${esc(branchKey)}', 'Branch Key')"><i class="fa-solid fa-copy"></i></button>
             </div>
           </div>
-          <small style="color:#64748b;">Give these credentials to the client. When they sign in, they will only see their purchased modules (${(build.modules||[]).map(moduleName).map(esc).join(", ")}).</small>
+          <div>
+            <small>Client Cloud Portal Link</small>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <strong><a href="${clientUrl}" target="_blank" style="color:#0284c7;text-decoration:underline;">${clientUrl}</a></strong>
+              <button type="button" class="btn-outline" style="padding:2px 6px; font-size:0.75rem;" onclick="copyToClipboard('${clientUrl}', 'Cloud URL')"><i class="fa-solid fa-copy"></i></button>
+            </div>
+          </div>
         </div>
 
-        <div class="summary">
-          <strong>Standalone AI Node Setup:</strong> Give the client the <strong>Branch Key</strong> above. They enter it in their AI Attendance application to connect cameras and start marking attendance.
+        <div style="background:#f8fafc; border:1px solid #dbe5ec; border-radius:12px; padding:16px; margin-bottom:16px;">
+          <h4 style="margin:0 0 10px; font-size:0.95rem; font-weight:800; color:#173042; display:flex; justify-content:space-between; align-items:center;">
+            <span><i class="fa-solid fa-key" style="color:#3d9fd4; margin-right:6px;"></i> Client Login Credentials</span>
+            <span style="font-size:0.75rem; background:#dcfce7; color:#166534; padding:2px 8px; border-radius:99px; font-weight:700;">Ready to send</span>
+          </h4>
+          
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
+            <div>
+              <small style="color:#64748b; font-weight:700;">Username / Email:</small>
+              <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
+                <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; flex:1;">${esc(defaultUser)}</div>
+                <button type="button" class="btn-outline" style="padding:6px 8px;" onclick="copyToClipboard('${esc(defaultUser)}', 'Username')"><i class="fa-solid fa-copy"></i></button>
+              </div>
+            </div>
+            <div>
+              <small style="color:#64748b; font-weight:700;">Password:</small>
+              <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
+                <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; flex:1;">${esc(defaultPass)}</div>
+                <button type="button" class="btn-outline" style="padding:6px 8px;" onclick="copyToClipboard('${esc(defaultPass)}', 'Password')"><i class="fa-solid fa-copy"></i></button>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex; justify-content:flex-end;">
+            <button type="button" class="btn-outline" style="font-size:0.8rem; font-weight:700; color:#0369a1; border-color:#7dd3fc;" onclick="copyToClipboard(\`${handoverText.replace(/`/g, '\\`')}\`, 'Complete Handover Sheet')">
+              <i class="fa-solid fa-clipboard-list" style="margin-right:4px;"></i> Copy Complete Client Handover Sheet
+            </button>
+          </div>
         </div>
 
-        <div class="form-actions" style="margin-top:20px;">
+        <div class="summary" style="margin-bottom:16px;">
+          <i class="fa-solid fa-video" style="color:#0284c7; margin-right:4px;"></i> <strong>Standalone AI Edge Node:</strong> Give the <strong>Branch Key</strong> to the client's on-site IT team. They enter it in their desktop AI Attendance application to stream local CCTV cameras.
+        </div>
+
+        <div class="form-actions" style="margin-top:16px;">
           <button class="btn-outline" data-action="close">Close</button>
           <a href="${clientUrl}" target="_blank" class="btn-primary" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px;">
-            <i class="fa-solid fa-arrow-up-right-from-square"></i> Open Client Dashboard
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Open Client Cloud Portal
           </a>
         </div>
       `);
