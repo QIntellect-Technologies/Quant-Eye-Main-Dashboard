@@ -1,10 +1,20 @@
 import sqlite3
 import os
 import uuid
+import json
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
 
-DB_PATH = os.environ.get("QINTELLECT_MAIN_DB_PATH") or os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.db")
+def _resolve_db_path() -> str:
+    if os.environ.get("QINTELLECT_MAIN_DB_PATH"):
+        return os.environ.get("QINTELLECT_MAIN_DB_PATH")
+    if os.environ.get("DATABASE_PATH"):
+        return os.environ.get("DATABASE_PATH")
+    if os.path.isdir("/data"):
+        return "/data/dashboard.db"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.db")
+
+DB_PATH = _resolve_db_path()
 
 def get_connection() -> sqlite3.Connection:
     """Return a SQLite connection with foreign keys enabled and row factory configured."""
@@ -346,51 +356,65 @@ def init_db() -> bool:
         ''', canonical_modules)
 
         # Seed initial Demo Organization if organizations is empty
-        cursor.execute("SELECT COUNT(*) FROM organizations")
-        if cursor.fetchone()[0] == 0:
-            org_id = "ORG-001"
-            cursor.execute('''
-                INSERT INTO organizations (id, name, industry, email, phone, address, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (org_id, "Demo Organization", "Technology", "contact@demo-org.com", "+92 300 1234567", "Tech Park, Suite 402", "Active"))
-
-            cursor.execute('''
-                INSERT INTO organization_contacts (organization_id, name, email, phone, role, is_primary)
-                VALUES (?, ?, ?, ?, ?, 1)
-            ''', (org_id, "Operations Director", "contact@demo-org.com", "+92 300 1234567", "Primary Contact"))
-
-            branch_id = "BR-01"
-            cursor.execute('''
-                INSERT INTO branches (id, organization_id, name, city, address, access, grace_days, employee_count, token_key, token_parent_id, token_started_at, token_expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (branch_id, org_id, "Main Branch", "Rahim Yar Khan", "Main Campus, Building A", "Active", 5, 38, "KEY-DEMO-001-BR01", "TOK-001", "2026-10-01", "2027-10-01"))
-
-            cursor.execute('''
-                INSERT INTO branch_contacts (organization_id, branch_id, name, phone, role, email)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (org_id, branch_id, "Branch Head", "+92 302 9633999", "Branch Manager", "branch@demo-org.com"))
-
-            # Subscribe default demo organization to initial commercial modules
-            for mod_id in ["attendance", "shifts", "overtime", "leave", "payroll"]:
+        def _seed_org(o_id, o_name, o_ind, o_email, o_phone, o_addr, o_emp, o_modules, o_tok, o_user, o_pass):
+            cursor.execute("SELECT COUNT(*) FROM organizations WHERE id = ? OR name = ?", (o_id, o_name))
+            if cursor.fetchone()[0] == 0:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO organization_modules (organization_id, module_id, enabled)
-                    VALUES (?, ?, 1)
-                ''', (org_id, mod_id))
+                    INSERT INTO organizations (id, name, industry, email, phone, address, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (o_id, o_name, o_ind, o_email, o_phone, o_addr, "Active"))
 
-            cursor.execute('''
-                INSERT OR IGNORE INTO organization_licenses (id, organization_id, token_key, started_at, expires_at, validity_days, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', ("TOK-001", org_id, "KEY-DEMO-001", "2026-10-01", "2027-10-01", 365, "Valid"))
+                cursor.execute('''
+                    INSERT INTO organization_contacts (organization_id, name, email, phone, role, is_primary)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                ''', (o_id, "Operations Director", o_email, o_phone, "Primary Contact"))
 
-            cursor.execute('''
-                INSERT OR IGNORE INTO organization_branding (organization_id, logo_url, app_title, primary_color, slogan)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (org_id, "", "QuantEye - Demo Org", "#0284c7", "DRIVING THE FUTURE TECHNOLOGY POWERED BY QUANTUM & AI"))
+                br_id = f"BR-{o_id}"
+                cursor.execute('''
+                    INSERT INTO branches (id, organization_id, name, city, address, access, grace_days, employee_count, token_key, token_parent_id, token_started_at, token_expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (br_id, o_id, "Main Branch", "Rahim Yar Khan", o_addr or "Main Campus", "Active", 5, o_emp, o_tok, f"TOK-{o_id}", "2026-10-01", "2027-10-01"))
 
-            cursor.execute('''
-                INSERT INTO platform_audit_logs (organization_id, branch_id, action, message)
-                VALUES (?, ?, 'SYSTEM_INIT', 'Initialized demo organization and default modules in persistent storage.')
-            ''', (org_id, branch_id))
+                cursor.execute('''
+                    INSERT INTO branch_contacts (organization_id, branch_id, name, phone, role, email)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (o_id, br_id, "Branch Manager", o_phone, "Branch Head", o_email))
+
+                for mod_id in o_modules:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO organization_modules (organization_id, module_id, enabled)
+                        VALUES (?, ?, 1)
+                    ''', (o_id, mod_id))
+
+                cursor.execute('''
+                    INSERT OR IGNORE INTO organization_licenses (id, organization_id, token_key, started_at, expires_at, validity_days, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (f"TOK-{o_id}", o_id, o_tok, "2026-10-01", "2027-10-01", 365, "Valid"))
+
+                cursor.execute('''
+                    INSERT OR IGNORE INTO organization_branding (organization_id, logo_url, app_title, primary_color, slogan)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (o_id, "", f"QuantEye - {o_name}", "#0284c7", "DRIVING THE FUTURE TECHNOLOGY POWERED BY QUANTUM & AI"))
+
+                manifest_json = json.dumps({
+                    "client_portal_url": "https://quanteye-ai-attendence-production.up.railway.app",
+                    "client_username": o_user,
+                    "client_password": o_pass,
+                    "branch_key": o_tok
+                })
+                cursor.execute('''
+                    INSERT OR IGNORE INTO application_builds (
+                        id, organization_id, organization_name, branch_id, branch_name, app_name,
+                        version, status, progress, download_manifest_json, modules_snapshot, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ''', (
+                    f"BUILD-{o_id}", o_id, o_name, br_id, "Main Branch", f"{o_name} Application",
+                    "v1.0.1", "succeeded", 100, manifest_json, json.dumps(o_modules)
+                ))
+
+        _seed_org("ORG-001", "Demo Organization", "Technology", "contact@demo-org.com", "+92 300 1234567", "Tech Park, Suite 402", 38, ["attendance", "shifts", "overtime", "leave", "payroll"], "KEY-DEMO-001-BR01", "admin@demo-org.com", "admin123")
+        _seed_org("ORG-311376", "Hello World", "Technology", "helloworld@gmail.com", "0300-2394422", "Tech City, Block B", 100, ["attendance", "shifts", "payroll"], "QE-HW-9B71C8", "helloworld@gmail.com", "admin123")
+        _seed_org("ORG-257281", "Optimum Tech", "Technology", "optimumtech@gmail.com", "0300-3823923", "Silicon Plaza, Fl 2", 38, ["attendance", "shifts", "payroll"], "QE-9A5DDEE7B01A41C18B2F", "optimumtech@gmail.com", "Pass1234!")
 
         conn.commit()
     return True
