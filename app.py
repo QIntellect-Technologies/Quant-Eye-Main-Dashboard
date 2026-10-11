@@ -1,60 +1,936 @@
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, session
+import os
+import json
+import secrets
+import urllib.request
+import urllib.error
+from functools import wraps
+from datetime import datetime
+from werkzeug.security import check_password_hash
+import database as db
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax'
+)
 
-MODULES = [
-    {"id": "attendance", "name": "Attendance Management", "icon": "fa-calendar-check", "description": "Track daily attendance, presence, and check-in activity.", "required": True},
-    {"id": "employees", "name": "Employee Management", "icon": "fa-users", "description": "Manage employee profiles, departments, and access.", "required": True},
-    {"id": "leave", "name": "Leave Management", "icon": "fa-plane-departure", "description": "Handle leave requests, balances, approvals, and policies.", "required": False},
-    {"id": "overtime", "name": "Overtime Management", "icon": "fa-clock", "description": "Review overtime hours, approvals, and summaries.", "required": False},
-    {"id": "shifts", "name": "Shift Management", "icon": "fa-business-time", "description": "Configure shifts, schedules, grace periods, and rosters.", "required": False},
-    {"id": "reports", "name": "Reports & Analytics", "icon": "fa-chart-line", "description": "Generate connected attendance and workforce reports.", "required": False},
-    {"id": "face-recognition", "name": "Face Recognition", "icon": "fa-camera", "description": "Enable biometric enrollment and camera recognition.", "required": False},
-    {"id": "payroll", "name": "Payroll", "icon": "fa-money-check-dollar", "description": "Prepare payroll inputs from attendance, leave, and overtime.", "required": False},
-]
+# Ensure database schema and default control plane users are initialized
+db.init_db()
+db.ensure_default_users()
 
-organizations = [
-    {
-        "id": "ORG-001",
-        "name": "Demo Organization",
-        "industry": "Technology",
-        "status": "Active",
-        "modules": ["attendance", "employees", "leave", "reports"],
-        "created": "10 Oct 2026",
+LOCAL_DASHBOARD_URL = os.environ.get("LOCAL_DASHBOARD_URL", "http://127.0.0.1:5000")
+LOCAL_HTTP_TIMEOUT = float(os.environ.get("LOCAL_HTTP_TIMEOUT", "3.0"))
+
+
+# ==============================================================================
+# AUTHENTICATION & ACCESS CONTROL DECORATORS (STEP 6)
+# ==============================================================================
+
+def get_current_user():
+    """Return active user dictionary if logged in, else None."""
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    user = db.get_user_by_id(user_id)
+    if not user or not user.get('active'):
+        session.clear()
+        return None
+    return user
+
+def require_auth(allowed_roles=None):
+    """Decorator ensuring request is from an active authenticated user."""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({"success": False, "error": "Authentication required. Please sign in."}), 401
+            if allowed_roles and user.get('role') not in allowed_roles:
+                return jsonify({"success": False, "error": "Access forbidden: insufficient permissions."}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def check_org_permission(target_org_id):
+    """
+    Check if current user is authorized for target_org_id.
+    platform_admin has access to everything.
+    organization_admin has access ONLY to their own organization_id.
+    """
+    user = get_current_user()
+    if not user:
+        return False, ("Authentication required", 401)
+    if user.get('role') == 'platform_admin':
+        return True, None
+    if user.get('role') == 'organization_admin':
+        user_org_id = user.get('organization_id')
+        if user_org_id and user_org_id == target_org_id:
+            return True, None
+        return False, ("Forbidden: You do not have permission to access another organization.", 403)
+    return False, ("Forbidden", 403)
+
+
+# ==============================================================================
+# AUTHENTICATION ENDPOINTS (STEP 6)
+# ==============================================================================
+
+@app.post("/api/auth/login")
+def auth_login():
+    """Authenticate control plane user and create secure session."""
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip()
+    password = str(payload.get("password", "")).strip()
+
+    if not email or not password:
+        return jsonify({"success": False, "error": "Email and password are required."}), 400
+
+    user = db.get_user_by_email(email)
+    if not user or not user.get('active'):
+        return jsonify({"success": False, "error": "Invalid email or account inactive."}), 401
+
+    if not check_password_hash(user['password_hash'], password):
+        return jsonify({"success": False, "error": "Incorrect password."}), 401
+
+    # Establish session
+    session.clear()
+    session['user_id'] = user['id']
+    session['role'] = user['role']
+    session['org_id'] = user.get('organization_id')
+    session['email'] = user['email']
+    session['name'] = user['name']
+
+    db.update_user_last_login(user['id'])
+
+    safe_user = {
+        "id": user['id'],
+        "name": user['name'],
+        "email": user['email'],
+        "role": user['role'],
+        "organization_id": user.get('organization_id')
     }
-]
+    return jsonify({"success": True, "message": "Sign in successful", "user": safe_user}), 200
 
+@app.post("/api/auth/logout")
+def auth_logout():
+    """Clear session and log user out."""
+    session.clear()
+    return jsonify({"success": True, "message": "Logged out successfully"}), 200
+
+@app.get("/api/auth/me")
+def auth_me():
+    """Return currently authenticated control plane user profile."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"authenticated": False}), 401
+    return jsonify({
+        "authenticated": True,
+        "user": {
+            "id": user['id'],
+            "name": user['name'],
+            "email": user['email'],
+            "role": user['role'],
+            "organization_id": user.get('organization_id')
+        }
+    }), 200
+
+
+# ==============================================================================
+# PAGE ROUTE
+# ==============================================================================
 
 @app.get("/")
 def dashboard():
-    return render_template("index.html", modules=MODULES, organizations=organizations)
+    modules = db.get_module_catalog()
+    organizations = db.get_all_organizations()
+    return render_template("index.html", modules=modules, organizations=organizations)
 
+
+# ==============================================================================
+# MODULE CATALOG
+# ==============================================================================
 
 @app.get("/api/modules")
+@require_auth()
 def list_modules():
-    return jsonify(MODULES)
+    try:
+        user = get_current_user()
+        modules = db.get_module_catalog()
+        # If organization_admin, show which modules are licensed/enabled for their organization
+        if user.get('role') == 'organization_admin':
+            org = db.get_organization_by_id(user.get('organization_id'))
+            enabled_set = set(org.get('modules', [])) if org else set()
+            for m in modules:
+                m['licensed_for_org'] = m['id'] in enabled_set
+        return jsonify(modules)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
+
+# ==============================================================================
+# ORGANIZATIONS ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/organizations")
+@require_auth()
+def get_organizations():
+    try:
+        user = get_current_user()
+        if user.get('role') == 'organization_admin':
+            org = db.get_organization_by_id(user.get('organization_id'))
+            return jsonify([org] if org else [])
+        orgs = db.get_all_organizations()
+        return jsonify(orgs)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.get("/api/organizations/<org_id>")
+@require_auth()
+def get_organization(org_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    try:
+        org = db.get_organization_by_id(org_id)
+        if not org:
+            return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
+        return jsonify(org)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.post("/api/organizations")
+@require_auth(allowed_roles=['platform_admin'])
 def create_organization():
     payload = request.get_json(silent=True) or {}
     name = str(payload.get("name", "")).strip()
     if not name:
-        return jsonify({"error": "Organization name is required."}), 400
+        return jsonify({"success": False, "error": "Organization name is required."}), 400
 
-    selected = list(dict.fromkeys(payload.get("modules") or ["attendance", "employees"]))
-    selected = [module["id"] for module in MODULES if module["id"] in selected or module["required"]]
-    organization = {
-        "id": f"ORG-{len(organizations) + 1:03d}",
-        "name": name,
-        "industry": str(payload.get("industry", "Not specified")).strip() or "Not specified",
-        "status": "Build Pending",
-        "modules": selected,
-        "created": "10 Oct 2026",
+    try:
+        org = db.create_organization(payload)
+        return jsonify(org), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.put("/api/organizations/<org_id>")
+@require_auth()
+def update_organization(org_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        updated = db.update_organization(org_id, payload)
+        if not updated:
+            return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
+        return jsonify(updated)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.delete("/api/organizations/<org_id>")
+@require_auth(allowed_roles=['platform_admin'])
+def delete_organization(org_id):
+    try:
+        success = db.delete_organization(org_id)
+        if not success:
+            return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
+        return jsonify({"success": True, "message": f"Organization '{org_id}' deleted."})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/organizations/<org_id>/toggle")
+@require_auth(allowed_roles=['platform_admin'])
+def toggle_organization_status(org_id):
+    try:
+        new_status = db.toggle_organization_status(org_id)
+        if not new_status:
+            return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
+        return jsonify({"success": True, "status": new_status})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# BRANCHES ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/branches")
+@require_auth()
+def list_branches():
+    org_id = request.args.get("organization_id")
+    user = get_current_user()
+    if user.get('role') == 'organization_admin':
+        org_id = user.get('organization_id')
+
+    try:
+        orgs = db.get_all_organizations()
+        branches = []
+        for o in orgs:
+            if not org_id or o["id"] == org_id:
+                for b in o.get("branches", []):
+                    branches.append({**b, "organizationId": o["id"], "organizationName": o["name"]})
+        return jsonify(branches)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/organizations/<org_id>/branches/<branch_id>/access")
+@require_auth()
+def update_branch_access(org_id, branch_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+    payload = request.get_json(silent=True) or {}
+    access = payload.get("access", "Suspended")
+    suspension = payload.get("suspension")
+    try:
+        success = db.update_branch_access(org_id, branch_id, access, suspension)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/organizations/<org_id>/branches/<branch_id>/reactivate")
+@require_auth()
+def reactivate_branch(org_id, branch_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+    try:
+        success = db.reactivate_branch(org_id, branch_id)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/organizations/<org_id>/branches/<branch_id>/grace")
+@require_auth()
+def update_branch_grace(org_id, branch_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+    payload = request.get_json(silent=True) or {}
+    grace_days = int(payload.get("graceDays", 0) or 0)
+    try:
+        success = db.update_branch_grace(org_id, branch_id, grace_days)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# LICENSES & TOKENS ENDPOINTS
+# ==============================================================================
+
+@app.post("/api/organizations/<org_id>/rotate-token")
+@require_auth()
+def rotate_token(org_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+    payload = request.get_json(silent=True) or {}
+    starts_at = payload.get("startsAt", "")
+    expires_at = payload.get("expiresAt", "")
+    validity_days = int(payload.get("validityDays", 30) or 30)
+    token_key = payload.get("tokenKey")
+    try:
+        result = db.rotate_organization_token(org_id, starts_at, expires_at, validity_days, token_key)
+        if not result:
+            return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# BRANDING ENDPOINTS
+# ==============================================================================
+
+@app.post("/api/organizations/<org_id>/branding")
+@require_auth()
+def update_branding(org_id):
+    allowed, err = check_org_permission(org_id)
+    if not allowed:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+    payload = request.get_json(silent=True) or {}
+    app_title = str(payload.get("appTitle", "")).strip()
+    logo_url = str(payload.get("logo", "")).strip()
+    try:
+        success = db.update_organization_branding(org_id, app_title, logo_url)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# BUILDS ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/builds")
+@require_auth()
+def list_builds():
+    try:
+        user = get_current_user()
+        builds = db.get_all_builds()
+        if user.get("role") == "organization_admin":
+            org_id = user.get("organization_id")
+            builds = [b for b in builds if b.get("organizationId") == org_id]
+        return jsonify(builds)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/builds")
+@require_auth()
+def create_build():
+    payload = request.get_json(silent=True) or {}
+    user = get_current_user()
+    if user.get("role") == "organization_admin":
+        payload["organizationId"] = user.get("organization_id")
+    try:
+        build = db.create_build(payload)
+        return jsonify(build), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.put("/api/builds/<build_id>")
+@require_auth()
+def update_build(build_id):
+    payload = request.get_json(silent=True) or {}
+    user = get_current_user()
+    if user.get("role") == "organization_admin":
+        builds = db.get_all_builds()
+        existing = next((b for b in builds if b.get("id") == build_id), None)
+        if not existing or existing.get("organizationId") != user.get("organization_id"):
+            return jsonify({"success": False, "error": "Access denied: build belongs to another organization"}), 403
+    try:
+        success = db.update_build(build_id, payload)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.delete("/api/builds/<build_id>")
+@require_auth()
+def delete_build(build_id):
+    user = get_current_user()
+    if user.get("role") == "organization_admin":
+        builds = db.get_all_builds()
+        existing = next((b for b in builds if b.get("id") == build_id), None)
+        if not existing or existing.get("organizationId") != user.get("organization_id"):
+            return jsonify({"success": False, "error": "Access denied: build belongs to another organization"}), 403
+    try:
+        success = db.delete_build(build_id)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# INVOICES & PAYMENTS ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/invoices")
+@require_auth()
+def list_invoices():
+    try:
+        user = get_current_user()
+        invoices = db.get_all_invoices()
+        if user.get("role") == "organization_admin":
+            org_id = user.get("organization_id")
+            invoices = [inv for inv in invoices if inv.get("organizationId") == org_id]
+        return jsonify(invoices)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/invoices")
+@require_auth(allowed_roles=['platform_admin'])
+def create_invoice():
+    payload = request.get_json(silent=True) or {}
+    try:
+        invoice = db.create_invoice(payload)
+        return jsonify(invoice), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.put("/api/invoices/<invoice_id>")
+@require_auth(allowed_roles=['platform_admin'])
+def update_invoice(invoice_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        success = db.update_invoice(invoice_id, payload)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/invoices/<invoice_id>/payments")
+@require_auth()
+def record_payment(invoice_id):
+    payload = request.get_json(silent=True) or {}
+    user = get_current_user()
+    if user.get("role") == "organization_admin":
+        invoices = db.get_all_invoices()
+        existing = next((inv for inv in invoices if inv.get("id") == invoice_id), None)
+        if not existing or existing.get("organizationId") != user.get("organization_id"):
+            return jsonify({"success": False, "error": "Access denied: invoice belongs to another organization"}), 403
+    try:
+        success = db.record_payment(invoice_id, payload)
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# PLATFORM ACTIVITY / AUDIT LOGS ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/activity")
+@require_auth()
+def list_activity():
+    try:
+        user = get_current_user()
+        limit = int(request.args.get("limit", 50))
+        logs = db.get_all_audit_logs(limit)
+        if user.get("role") == "organization_admin":
+            org_id = user.get("organization_id")
+            logs = [l for l in logs if l.get("organizationId") == org_id]
+        return jsonify(logs)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.post("/api/activity")
+@require_auth()
+def log_activity():
+    payload = request.get_json(silent=True) or {}
+    message = str(payload.get("message", "")).strip()
+    org_id = payload.get("organizationId")
+    branch_id = payload.get("branchId")
+    user = get_current_user()
+    if user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    if not message:
+        return jsonify({"success": False, "error": "Message is required."}), 400
+    try:
+        db.record_audit_log(message, org_id, branch_id)
+        return jsonify({"success": True}), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# ONE-TIME SAFE LOCALSTORAGE MIGRATION ENDPOINT
+# ==============================================================================
+
+@app.post("/api/sync-localstorage")
+@require_auth(allowed_roles=['platform_admin'])
+def sync_localstorage():
+    """Import existing browser localStorage data if dashboard.db only has default seed."""
+    payload = request.get_json(silent=True) or {}
+    imported = {"organizations": 0, "builds": 0, "invoices": 0}
+    try:
+        # Import orgs if provided
+        client_orgs = payload.get("organizations", [])
+        if client_orgs:
+            for co in client_orgs:
+                existing = db.get_organization_by_id(co.get("id"))
+                if not existing and co.get("name"):
+                    db.create_organization(co)
+                    imported["organizations"] += 1
+                elif existing:
+                    db.update_organization(co["id"], co)
+
+        # Import builds if provided
+        client_builds = payload.get("builds", [])
+        existing_builds = {b["id"] for b in db.get_all_builds()}
+        for cb in client_builds:
+            if cb.get("id") not in existing_builds:
+                db.create_build(cb)
+                imported["builds"] += 1
+
+        # Import invoices if provided
+        client_invoices = payload.get("invoices", [])
+        existing_invoices = {inv["id"] for inv in db.get_all_invoices()}
+        for ci in client_invoices:
+            if ci.get("id") not in existing_invoices:
+                db.create_invoice(ci)
+                imported["invoices"] += 1
+
+        return jsonify({"success": True, "imported": imported})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==============================================================================
+# STEP 4: LOCAL DASHBOARD INTEGRATION CLIENT ENDPOINTS
+# ==============================================================================
+
+def query_local_dashboard(endpoint, method="GET", payload=None):
+    """Safely query Local Dashboard via HTTP. Never crash Main Dashboard on failure."""
+    url = f"{LOCAL_DASHBOARD_URL.rstrip('/')}{endpoint}"
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=LOCAL_HTTP_TIMEOUT) as response:
+            res_body = response.read().decode("utf-8")
+            return {
+                "ok": True,
+                "status_code": response.status,
+                "data": json.loads(res_body) if res_body else {}
+            }
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "error": f"HTTP Error {e.code}: {e.reason}",
+            "details": error_body
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": f"Connection failed: {str(e)}"
+        }
+
+
+@app.get("/api/integration/local/status")
+@require_auth()
+def get_local_dashboard_status():
+    """
+    Check Local Dashboard health and integration status.
+    Returns connected=False with safe error if Local Dashboard is offline.
+    """
+    # 1. Heartbeat check on existing /api/health
+    health_resp = query_local_dashboard("/api/health", method="GET")
+    if not health_resp.get("ok"):
+        return jsonify({
+            "connected": False,
+            "local_status": "disconnected",
+            "error": health_resp.get("error", "Local Dashboard unavailable"),
+            "target_url": LOCAL_DASHBOARD_URL,
+            "timestamp": datetime.now().isoformat()
+        }), 200
+
+    # 2. Detailed integration contract status
+    status_resp = query_local_dashboard("/api/integration/status", method="GET")
+    if not status_resp.get("ok"):
+        return jsonify({
+            "connected": True,
+            "local_status": "healthy",
+            "linked": False,
+            "error": "Integration status endpoint unreachable",
+            "timestamp": datetime.now().isoformat()
+        }), 200
+
+    local_data = status_resp.get("data", {})
+    return jsonify({
+        "connected": True,
+        "local_status": local_data.get("local_status", "healthy"),
+        "linked": local_data.get("linked", False),
+        "organization_id": local_data.get("organization_id"),
+        "organization_name": local_data.get("organization_name"),
+        "branch_id": local_data.get("branch_id"),
+        "branch_name": local_data.get("branch_name"),
+        "branch_status": local_data.get("branch_status"),
+        "license_id": local_data.get("license_id"),
+        "license_status": local_data.get("license_status"),
+        "license_start": local_data.get("license_start"),
+        "license_expiry": local_data.get("license_expiry"),
+        "licensed_modules": local_data.get("licensed_modules", []),
+        "last_sync_timestamp": local_data.get("last_sync_timestamp"),
+        "local_instance_id": local_data.get("local_instance_id"),
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
+
+@app.post("/api/integration/local/sync")
+@require_auth()
+def sync_to_local_dashboard():
+    """
+    Push organization, branch, and license entitlement from Main Dashboard to Local Dashboard.
+    """
+    user = get_current_user()
+    payload = request.get_json(silent=True) or {}
+    org_id = payload.get("organization_id")
+    if user.get("role") == "organization_admin":
+        if org_id and org_id != user.get("organization_id"):
+            return jsonify({"success": False, "error": "Access denied: cannot sync another organization's branch"}), 403
+        org_id = user.get("organization_id")
+
+    branch_id = payload.get("branch_id")
+
+    # If org_id or branch_id provided, fetch details from Main DB dashboard.db
+    org_name = payload.get("organization_name")
+    branch_name = payload.get("branch_name")
+    branch_status = payload.get("branch_status", "active")
+    modules = payload.get("licensed_modules")
+
+    if org_id:
+        org = db.get_organization_by_id(org_id)
+        if org:
+            org_name = org.get("name")
+            if modules is None:
+                modules = org.get("modules", [])
+            if branch_id:
+                for b in org.get("branches", []):
+                    if b.get("id") == branch_id:
+                        branch_name = b.get("name")
+                        branch_status = b.get("status", "active")
+                        break
+
+    # Prepare sync package
+    sync_package = {
+        "organization_id": org_id,
+        "organization_name": org_name,
+        "branch_id": branch_id,
+        "branch_name": branch_name,
+        "branch_status": branch_status,
+        "license_id": payload.get("license_id", "LIC-DEFAULT"),
+        "license_status": payload.get("license_status", "active"),
+        "license_start": payload.get("license_start"),
+        "license_expiry": payload.get("license_expiry"),
+        "licensed_modules": modules if modules is not None else [
+            "attendance", "employees", "leave", "overtime",
+            "shifts", "reports", "face-recognition", "payroll"
+        ],
+        "local_instance_id": payload.get("local_instance_id", "LOC-INST-001")
     }
-    organizations.append(organization)
-    return jsonify(organization), 201
+
+    sync_resp = query_local_dashboard("/api/integration/sync", method="POST", payload=sync_package)
+    if not sync_resp.get("ok"):
+        return jsonify({
+            "success": False,
+            "error": sync_resp.get("error", "Failed to sync to Local Dashboard"),
+            "details": sync_resp.get("details")
+        }), 502
+
+    # Log activity in Main Dashboard dashboard.db
+    try:
+        db.record_audit_log(f"Synchronized branch {branch_id} ({branch_name}) with Local Dashboard", org_id, branch_id)
+    except Exception:
+        pass
+
+    return jsonify({
+        "success": True,
+        "synced": sync_package,
+        "response": sync_resp.get("data")
+    }), 200
+
+
+# ==============================================================================
+# CLOUD CAMERA CONFIGURATION & REAL-TIME EVENT INGESTION
+# ==============================================================================
+
+@app.get("/api/branches/<branch_id>/cameras")
+def get_cameras_for_branch(branch_id):
+    """Fetch cloud-configured camera streams for a client node or dashboard."""
+    org_id = request.args.get("organization_id")
+    # If authenticated user, respect organization scoping
+    user = get_current_user()
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+
+    if not org_id:
+        # Fallback to default demo organization if unauthenticated node request
+        org_id = "ORG-001"
+
+    cams = db.get_branch_cameras(org_id, branch_id)
+    # If no cameras explicitly saved in Cloud DB, automatically import from Local Dashboard
+    if not cams:
+        local_cams_resp = query_local_dashboard("/api/cameras", method="GET")
+        if local_cams_resp.get("ok") and isinstance(local_cams_resp.get("data"), list) and local_cams_resp.get("data"):
+            cams = []
+            for idx, lc in enumerate(local_cams_resp["data"], start=1):
+                cams.append({
+                    "id": lc.get("camera_id") or f"cam_{lc.get('id')}",
+                    "name": lc.get("name") or f"Camera {idx}",
+                    "camera_type": lc.get("camera_type", "rtsp"),
+                    "rtsp_url": str(lc.get("rtsp_url", "")),
+                    "room_name": lc.get("room_name", "Entrance"),
+                    "channel_number": idx,
+                    "active": int(lc.get("active", 1))
+                })
+            # Persist in Cloud DB so Cloud is authoritative
+            db.set_branch_cameras(org_id, branch_id, cams)
+        else:
+            # Fallback default USB webcam
+            cams = [
+                {
+                    "id": "cam_webcam_0",
+                    "name": "Live Entrance Camera",
+                    "camera_type": "webcam",
+                    "rtsp_url": "0",
+                    "room_name": "Main Entrance",
+                    "channel_number": 1,
+                    "active": 1
+                }
+            ]
+    return jsonify({
+        "success": True,
+        "organization_id": org_id,
+        "branch_id": branch_id,
+        "cameras": cams,
+        "count": len(cams)
+    }), 200
+
+
+@app.post("/api/branches/<branch_id>/cameras")
+@require_auth()
+def update_cameras_for_branch(branch_id):
+    """Save cloud-configured cameras for a branch."""
+    payload = request.get_json(silent=True) or {}
+    org_id = payload.get("organization_id")
+    user = get_current_user()
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-001"
+
+    cameras = payload.get("cameras", [])
+    db.set_branch_cameras(org_id, branch_id, cameras)
+    db.record_audit_log(f"Updated {len(cameras)} cameras for Branch {branch_id}", org_id, branch_id)
+    return jsonify({
+        "success": True,
+        "message": f"Successfully updated {len(cameras)} cameras for Branch {branch_id}",
+        "cameras": cameras
+    }), 200
+
+
+@app.post("/api/sync/attendance-event")
+def ingest_attendance_event():
+    """
+    Real-time push ingestion endpoint.
+    Called immediately by QuantEye-Client-Node whenever a face is recognized.
+    """
+    event_payload = request.get_json(silent=True) or {}
+    if not event_payload.get("name") and not event_payload.get("user_id"):
+        return jsonify({"success": False, "error": "Missing employee identification"}), 400
+
+    org_id = event_payload.get("organization_id") or "ORG-001"
+    branch_id = event_payload.get("branch_id") or "BR-FORK-01"
+    event_payload["organization_id"] = org_id
+    event_payload["branch_id"] = branch_id
+
+    event_id = db.record_live_attendance_sync_event(event_payload)
+
+    # Immediately relay to Local Dashboard so the client's Attendance Report updates in real-time
+    try:
+        query_local_dashboard("/api/attendance/edge-mark", method="POST", payload=event_payload)
+    except Exception:
+        pass
+
+    return jsonify({
+        "success": True,
+        "event_id": event_id,
+        "message": f"Attendance event for '{event_payload.get('name')}' synced to Cloud in real time",
+        "timestamp": event_payload.get("timestamp") or datetime.now().isoformat()
+    }), 201
+
+
+@app.get("/api/sync/live-feed")
+def get_live_attendance_feed():
+    """Fetch real-time synced attendance stream for Cloud Dashboard UI."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-001"
+
+    branch_id = request.args.get("branch_id")
+    limit = int(request.args.get("limit", 30))
+    events = db.get_live_attendance_sync_events(org_id, branch_id=branch_id, limit=limit)
+    return jsonify({
+        "success": True,
+        "organization_id": org_id,
+        "branch_id": branch_id,
+        "events": events,
+        "count": len(events)
+    }), 200
+
+
+@app.post("/api/edge/validate-key")
+def validate_edge_branch_key():
+    """
+    Dynamic Edge Activation endpoint.
+    Called by Standalone AI Attendance EXE to authenticate against any organization/branch.
+    Works dynamically for ANY newly created organization or branch without hardcoding.
+    """
+    payload = request.get_json(silent=True) or {}
+    branch_key = payload.get("branch_key") or payload.get("key")
+    if not branch_key:
+        return jsonify({"success": False, "error": "Branch key is required"}), 400
+
+    branch_info = db.get_branch_by_token_key(branch_key)
+    if not branch_info:
+        return jsonify({"success": False, "error": "Invalid Branch Key. Please verify key from your dashboard."}), 404
+
+    if branch_info.get("organization_status") != "Active" or branch_info.get("branch_access") != "Active":
+        return jsonify({
+            "success": False,
+            "error": "Branch access is suspended or inactive. Please contact your organization administrator."
+        }), 403
+
+    org_id = branch_info["organization_id"]
+    b_id = branch_info["branch_id"]
+
+    # Fetch dynamic cameras configured for this specific branch
+    cameras = db.get_branch_cameras(org_id, b_id)
+    if not cameras:
+        try:
+            local_cams_resp = query_local_dashboard("/api/cameras", method="GET")
+            if local_cams_resp.get("ok") and isinstance(local_cams_resp.get("data"), list) and local_cams_resp.get("data"):
+                cameras = []
+                for idx, lc in enumerate(local_cams_resp["data"], start=1):
+                    cameras.append({
+                        "id": lc.get("camera_id") or f"cam_{lc.get('id')}",
+                        "name": lc.get("name") or f"Camera {idx}",
+                        "camera_type": lc.get("camera_type", "rtsp"),
+                        "rtsp_url": str(lc.get("rtsp_url", "")),
+                        "room_name": lc.get("room_name", "Entrance"),
+                        "channel_number": idx,
+                        "active": int(lc.get("active", 1))
+                    })
+                db.set_branch_cameras(org_id, b_id, cameras)
+        except Exception:
+            pass
+
+    if not cameras:
+        cameras = [
+            {
+                "id": "cam_webcam_0",
+                "name": f"{branch_info['branch_name']} Camera 1",
+                "camera_type": "webcam",
+                "rtsp_url": "0",
+                "room_name": "Main Entrance",
+                "channel_number": 1,
+                "active": 1
+            }
+        ]
+
+    return jsonify({
+        "success": True,
+        "organization_id": org_id,
+        "organization_name": branch_info["organization_name"],
+        "branch_id": b_id,
+        "branch_name": branch_info["branch_name"],
+        "token_expires_at": branch_info.get("token_expires_at"),
+        "cameras": cameras,
+        "camera_count": len(cameras),
+        "message": f"Successfully authenticated {branch_info['organization_name']} - {branch_info['branch_name']}"
+    }), 200
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5100)
+    port = int(os.environ.get("PORT", "5100"))
+    host = os.environ.get("HOST", "0.0.0.0")
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host=host, port=port, debug=debug)
+
+

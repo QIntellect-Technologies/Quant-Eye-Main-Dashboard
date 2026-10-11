@@ -7,3 +7,5 @@ dashboard.db
 dashboard.db-*
 builds/*
 !builds/.gitkeep
+scratch/
+.playwright-mcp/

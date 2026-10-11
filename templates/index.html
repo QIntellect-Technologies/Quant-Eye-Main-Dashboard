@@ -111,7 +111,23 @@
     <div class="sidebar-footer"><button class="back-products" data-action="back-products"><i class="fa-solid fa-arrow-left"></i> Back to Products</button><div><i class="fa-solid fa-circle-check" style="color:#3d9fd4"></i> Frontend demo workspace<br><span class="mono">LOCAL STORAGE MODE</span></div></div>
   </aside>
   <main class="main">
-    <header class="topbar"><div><div class="eyebrow">Central control panel</div><h1 id="pageTitle">Main Dashboard</h1></div><div class="user-pill"><span class="avatar"><i class="fa-solid fa-user"></i></span> Platform Admin</div></header>
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">Central control panel</div>
+        <h1 id="pageTitle">Main Dashboard</h1>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div id="localDashboardBadge" style="display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border:1px solid var(--line);border-radius:20px;background:#fff;font-size:.8rem;font-weight:700;">
+          <span id="localDashboardDot" style="width:9px;height:9px;border-radius:50%;background:#8da7b5;display:inline-block;"></span>
+          <span id="localDashboardText">Local Dashboard: Checking...</span>
+        </div>
+        <div class="user-pill" id="currentUserPill">
+          <span class="avatar"><i class="fa-solid fa-user"></i></span>
+          <span id="currentUserName">Sign In</span>
+          <button id="logoutBtn" class="btn-outline" style="padding:4px 8px;font-size:0.75rem;margin-left:6px;border-radius:6px;" onclick="handleLogout(event)" title="Log Out"><i class="fa-solid fa-right-from-bracket"></i></button>
+        </div>
+      </div>
+    </header>
     <section id="overview" class="section">
       <div class="stats">
         <div class="card stat"><div><div class="stat-label">TOTAL ORGANIZATIONS</div><div class="stat-value" id="statOrganizations">0</div><small class="stat-meta">Registered workspaces</small></div><div class="stat-icon"><i class="fa-solid fa-building"></i></div></div>
@@ -167,17 +183,115 @@
     <footer style="margin-top:34px;padding:18px 4px;border-top:1px solid var(--line);color:#628095;font-size:.78rem;text-align:center">© 2026 QIntellect Technologies. All rights reserved.<br><strong>Powered by QIntellect Technologies</strong></footer>
   </main>
   <div class="modal-backdrop-lite" id="modal"><div class="modal-box" id="modalContent"></div></div>
+  <div class="modal-backdrop-lite" id="loginModal" style="display:none;z-index:9999;">
+    <div class="modal-box" style="width:min(440px,calc(100% - 30px));margin:auto;text-align:center;padding:36px 30px;">
+      <div style="margin-bottom:18px;">
+        <img src="/static/Logo.png" alt="QIntellect Logo" style="height:64px;object-fit:contain;">
+      </div>
+      <h2 style="font-size:1.35rem;margin-bottom:6px;font-weight:800;">Control Plane Sign In</h2>
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:22px;">QIntellect Main Dashboard Access Control</p>
+      <div id="loginError" style="display:none;padding:11px 14px;margin-bottom:16px;border-radius:9px;background:#fff1f1;color:var(--danger);font-size:0.84rem;font-weight:600;text-align:left;"></div>
+      <form id="loginForm" onsubmit="handleLoginSubmit(event)" style="text-align:left;">
+        <div class="form-group" style="margin-bottom:14px;">
+          <label style="margin-bottom:6px;">Email Address</label>
+          <input type="email" id="loginEmail" class="form-control" required placeholder="admin@qintellect.com" style="width:100%;">
+        </div>
+        <div class="form-group" style="margin-bottom:22px;">
+          <label style="margin-bottom:6px;">Password</label>
+          <input type="password" id="loginPassword" class="form-control" required placeholder="••••••••" style="width:100%;">
+        </div>
+        <button type="submit" class="btn-primary" style="width:100%;padding:12px;font-size:0.95rem;">
+          <i class="fa-solid fa-lock" style="margin-right:6px;"></i> Sign In
+        </button>
+        <div style="margin-top:16px;font-size:0.75rem;color:var(--muted);text-align:center;line-height:1.4;">
+          Platform Admin: <code>admin@qintellect.com</code><br>
+          Org Admin: <code>admin@forknknives.com</code>
+        </div>
+      </form>
+    </div>
+  </div>
   <div class="toast-box" id="toasts"></div>
   <script>
+    let currentUser = null;
+
+    async function checkAuth(){
+      try{
+        const res = await fetch("/api/auth/me");
+        if(res.ok){
+          const data = await res.json();
+          currentUser = data.user;
+          const nameEl = document.getElementById("currentUserName");
+          if(nameEl){
+            const roleLabel = currentUser.role === 'platform_admin' ? 'Platform Admin' : 'Org Admin';
+            nameEl.textContent = `${currentUser.name} (${roleLabel})`;
+          }
+          const loginM = document.getElementById("loginModal");
+          if(loginM) loginM.style.display = "none";
+          // If Org Admin, restrict create buttons
+          if(currentUser.role === 'organization_admin'){
+            document.querySelectorAll('[data-action="create"]').forEach(el => el.style.display = "none");
+          }
+          return true;
+        } else {
+          showLoginModal();
+          return false;
+        }
+      }catch(e){
+        showLoginModal();
+        return false;
+      }
+    }
+
+    function showLoginModal(){
+      const modal = document.getElementById("loginModal");
+      if(modal){
+        modal.style.display = "grid";
+      }
+    }
+
+    async function handleLoginSubmit(e){
+      if(e) e.preventDefault();
+      const email = document.getElementById("loginEmail").value.trim();
+      const password = document.getElementById("loginPassword").value;
+      const errBox = document.getElementById("loginError");
+      errBox.style.display = "none";
+
+      try{
+        const res = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({email, password})
+        });
+        const data = await res.json();
+        if(res.ok && data.success){
+          currentUser = data.user;
+          document.getElementById("loginModal").style.display = "none";
+          notify("Logged in successfully as " + currentUser.name);
+          await reloadData();
+          await checkAuth();
+        } else {
+          errBox.textContent = data.error || "Invalid login credentials";
+          errBox.style.display = "block";
+        }
+      }catch(err){
+        errBox.textContent = "Sign in failed: " + err.message;
+        errBox.style.display = "block";
+      }
+    }
+
+    async function handleLogout(e){
+      if(e) e.stopPropagation();
+      try{
+        await fetch("/api/auth/logout", {method: "POST"});
+      }catch(err){}
+      location.reload();
+    }
     const MODULES=[
       {id:"attendance",name:"AI Face Recognition Attendance",icon:"fa-calendar-check",description:"Track attendance, presence, and recognition events.",category:"core",required:true},
-      {id:"employees",name:"Employee Management",icon:"fa-users",description:"Manage employee profiles, departments, and access.",category:"core",required:true},
-      {id:"leave",name:"Leave Management",icon:"fa-plane-departure",description:"Manage requests, balances, approvals, and policies.",category:"workforce"},
-      {id:"overtime",name:"Overtime Management",icon:"fa-clock",description:"Track overtime hours, approvals, and summaries.",category:"workforce"},
       {id:"shifts",name:"Shift Management",icon:"fa-business-time",description:"Configure shifts, schedules, and rosters.",category:"workforce"},
-      {id:"reports",name:"Reports & Analytics",icon:"fa-chart-line",description:"Generate connected workforce reports.",category:"analytics"},
-      {id:"face-recognition",name:"Camera Recognition",icon:"fa-camera",description:"Enable biometric enrollment and cameras.",category:"core"},
-      {id:"payroll",name:"Payroll",icon:"fa-money-check-dollar",description:"Prepare payroll inputs from connected records.",category:"workforce"}
+      {id:"overtime",name:"Overtime Management",icon:"fa-clock",description:"Track overtime hours, approvals, and summaries.",category:"workforce"},
+      {id:"leave",name:"Leave Management",icon:"fa-plane-departure",description:"Manage requests, balances, approvals, and policies.",category:"workforce"},
+      {id:"payroll",name:"Payroll Management",icon:"fa-money-check-dollar",description:"Prepare payroll inputs from connected records.",category:"workforce"}
     ];
     const STORE={orgs:"qintellect.dashboard.orgs",builds:"qintellect.dashboard.builds",activity:"qintellect.dashboard.activity",invoices:"qintellect.dashboard.invoices",portal:"qintellect.dashboard.portal"};
     const FOOTER_TEXT="© 2026 QIntellect Technologies. All rights reserved.";
@@ -187,16 +301,60 @@
     const COMPANY_DETAILS={name:"QIntellect Technologies",phone:"+92 302 9633999",email:"info@qintellecttechnologies.com",website:"qintellecttechnologies.com",branch:"Main Branch, Rahim Yar Khan"};
     const BANK_DETAILS={accountTitle:"QIntellect Technologies",bankName:"United Bank Limited (UBL)",iban:"PK46UNIL0109000400912116"};
     const seedOrgs=[{id:"ORG-001",name:"Demo Organization",industry:"Technology",email:"admin@demo.local",phone:"",address:"",status:"Active",modules:["attendance","employees","leave","reports"],branches:[{name:"Main Branch",city:"",address:"",access:"Active",graceDays:7}],branding:{logo:"",appTitle:"Demo Organization Application"},createdAt:"2026-10-10T08:00:00Z",updatedAt:"2026-10-10T08:00:00Z"}];
-    let organizations=load(STORE.orgs,seedOrgs), builds=load(STORE.builds,[]), activity=load(STORE.activity,[]), invoices=load(STORE.invoices,[]);
+    let organizations=[], builds=[], activity=[], invoices=[];
     let currentPage="overview", selectedBuildOrg="", selectedBuildHistoryOrg="";
     function load(key,fallback){try{const value=JSON.parse(localStorage.getItem(key));return value??fallback}catch{return fallback}}
-    function save(){localStorage.setItem(STORE.orgs,JSON.stringify(organizations));localStorage.setItem(STORE.builds,JSON.stringify(builds));localStorage.setItem(STORE.activity,JSON.stringify(activity));localStorage.setItem(STORE.invoices,JSON.stringify(invoices))}
+    function save(){/* Legacy no-op: persistence handled via backend APIs */}
+    async function reloadData(){
+      try{
+        const [orgs,blds,invs,acts]=await Promise.all([
+          fetch("/api/organizations").then(r=>r.json()),
+          fetch("/api/builds").then(r=>r.json()),
+          fetch("/api/invoices").then(r=>r.json()),
+          fetch("/api/activity").then(r=>r.json())
+        ]);
+        if(Array.isArray(orgs))organizations=orgs;
+        if(Array.isArray(blds))builds=blds;
+        if(Array.isArray(invs))invoices=invs;
+        if(Array.isArray(acts))activity=acts;
+        organizations.forEach(normalizeOrg);
+        normalizeBuildHistory();
+        render();
+      }catch(e){
+        console.error("Backend fetch error:",e);
+      }
+    }
+    async function checkLocalStorageMigration(){
+      const localOrgs=load(STORE.orgs,null),localBuilds=load(STORE.builds,null),localInvoices=load(STORE.invoices,null);
+      if(localOrgs&&Array.isArray(localOrgs)&&localOrgs.length>0){
+        try{
+          const res=await fetch("/api/sync-localstorage",{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({organizations:localOrgs,builds:localBuilds||[],invoices:localInvoices||[]})
+          });
+          if(res.ok){
+            const result=await res.json();
+            // Verify database records actually exist before removing localStorage
+            const verifyOrgs=await fetch("/api/organizations").then(r=>r.json());
+            if(Array.isArray(verifyOrgs)&&verifyOrgs.length>=localOrgs.length){
+              localStorage.removeItem(STORE.orgs);
+              localStorage.removeItem(STORE.builds);
+              localStorage.removeItem(STORE.invoices);
+              localStorage.removeItem(STORE.activity);
+            }
+          }
+        }catch(e){
+          console.warn("Migration notice:",e);
+        }
+      }
+    }
     function esc(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
     function date(value){return new Date(value).toLocaleDateString(undefined,{day:"2-digit",month:"short",year:"numeric"})}
     function statusBadge(status){const cls=status==="succeeded"||status==="Active"||status==="Paid"?"":" "+(status==="failed"||status==="Inactive"||status==="Suspended"||status==="Cancelled"?"danger":"pending");const icon=status==="succeeded"||status==="Active"||status==="Paid"?"fa-circle-check":status==="failed"||status==="Inactive"||status==="Suspended"||status==="Cancelled"?"fa-circle-xmark":"fa-clock";return `<span class="badge${cls}"><i class="fa-solid ${icon}" aria-hidden="true"></i>${esc(status)}</span>`}
     function moduleName(id){const module=MODULES.find(item=>item.id===id);return module?module.name:id}
     function notify(message,error=false){const toast=document.createElement("div");toast.className="toast-message"+(error?" error":"");toast.innerHTML=`<i class="fa-solid ${error?"fa-circle-exclamation":"fa-circle-check"}"></i> ${esc(message)}`;document.getElementById("toasts").append(toast);setTimeout(()=>toast.remove(),3200)}
-    function record(message){activity.unshift({message,at:new Date().toISOString()});activity=activity.slice(0,8);save()}
+    function record(message,orgId=null,branchId=null){activity.unshift({message,at:new Date().toISOString()});activity=activity.slice(0,8);fetch("/api/activity",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message,organizationId:orgId,branchId})}).catch(()=>{})}
     function money(value){return new Intl.NumberFormat(undefined,{style:"currency",currency:"USD"}).format(Number(value)||0)}
     function invoiceBalance(invoice){return Math.max(0,Number(invoice.total||0)-Number(invoice.paid||0))}
     function invoiceStatus(invoice){if(invoice.status==="Cancelled"||invoice.status==="Draft")return invoice.status;if(invoiceBalance(invoice)<=0)return "Paid";if(new Date(invoice.dueDate)<new Date())return "Overdue";return Number(invoice.paid||0)>0?"Partially Paid":"Unpaid"}
@@ -332,10 +490,26 @@
       const branchCards=org.branches.map((branch,index)=>{
         const access=effectiveBranchAccess(org,branch),linkedInvoices=branchInvoices(org.id,branch.id),openInvoices=linkedInvoices.filter(invoiceNeedsPayment),outstandingBalance=openInvoices.reduce((sum,invoice)=>sum+invoiceBalance(invoice),0),branchPaid=linkedInvoices.reduce((sum,invoice)=>sum+Math.min(Number(invoice.total||0),Number(invoice.paid||0)),0),suspension=branch.suspension,temporaryEnd=suspension&&suspension.endsAt?date(suspension.endsAt):"";
         const invoiceRows=linkedInvoices.map(invoice=>`<div class="branch-invoice-row"><div><strong>${esc(invoice.number)}</strong><small>${esc(invoice.organizationName||org.name)} · ${esc(invoice.branchName||branch.name)} · Due ${invoice.dueDate?date(invoice.dueDate):"—"}</small></div><div><strong>${money(invoiceBalance(invoice))}</strong><small>Balance due</small></div><div>${statusBadge(invoiceStatus(invoice))}<button class="btn-outline" data-action="invoice-details" data-id="${esc(invoice.id)}">View</button></div></div>`).join("");
-        return `<article class="branch-workspace"><div class="branch-workspace-head"><div><h3><i class="fa-solid fa-code-branch" style="color:#3d9fd4"></i> ${esc(branch.name)}</h3><p>${esc(branch.city||"City not set")} · ${esc(branch.address||"Address not set")}</p></div><div class="detail-hero-actions">${statusBadge(access)}<button class="btn-outline" data-action="manage-branch-access" data-id="${esc(org.id)}" data-branch-id="${esc(branch.id)}">Manage access</button><button class="btn-outline" data-action="create-branch-invoice" data-org-id="${esc(org.id)}" data-branch-id="${esc(branch.id)}"><i class="fa-solid fa-file-invoice-dollar"></i> Create invoice</button></div></div>
-          <div class="branch-workspace-meta"><div><small>TOTAL EMPLOYEES</small><strong>${Number(branch.employeeCount||0)}</strong></div><div><small>BRANCH ACCESS</small><strong>${esc(access)}</strong></div><div><small>BRANCH INVOICES</small><strong>${linkedInvoices.length}</strong></div><div><small>OUTSTANDING BALANCE</small><strong>${money(outstandingBalance)}</strong></div></div>
+        
+        // Step 5: Compute real-time Local Dashboard integration state for this branch
+        const isCurrentLinked = _lastLocalIntegrationStatus && _lastLocalIntegrationStatus.linked && _lastLocalIntegrationStatus.branch_id === branch.id;
+        let connectionBadge = '<span class="badge" style="background:#f1f5f9;color:#64748b"><i class="fa-solid fa-circle-nodes"></i> Not Linked</span>';
+        let connectionNote = 'No local instance connected to this branch.';
+        if (access === "Suspended") {
+          connectionBadge = '<span class="badge danger"><i class="fa-solid fa-ban"></i> Suspended</span>';
+          connectionNote = 'Branch access is administratively suspended.';
+        } else if (_lastLocalIntegrationStatus && !_lastLocalIntegrationStatus.connected && isCurrentLinked) {
+          connectionBadge = '<span class="badge danger"><i class="fa-solid fa-circle-xmark"></i> Disconnected</span>';
+          connectionNote = 'Linked local instance is currently unreachable.';
+        } else if (isCurrentLinked) {
+          connectionBadge = '<span class="badge"><i class="fa-solid fa-circle-check"></i> Connected</span>';
+          connectionNote = `Linked to ${_lastLocalIntegrationStatus.local_instance_id || 'LOC-INST-001'} · Modules: ${_lastLocalIntegrationStatus.licensed_modules?.length || 8}/8`;
+        }
+
+        return `<article class="branch-workspace"><div class="branch-workspace-head"><div><h3><i class="fa-solid fa-code-branch" style="color:#3d9fd4"></i> ${esc(branch.name)}</h3><p>${esc(branch.city||"City not set")} · ${esc(branch.address||"Address not set")}</p></div><div class="detail-hero-actions">${connectionBadge}${statusBadge(access)}<button class="btn-outline" data-action="manage-branch-access" data-id="${esc(org.id)}" data-branch-id="${esc(branch.id)}">Manage access</button><button class="btn-primary" data-action="link-local-dashboard" data-id="${esc(org.id)}" data-branch-id="${esc(branch.id)}"><i class="fa-solid fa-link"></i> ${isCurrentLinked?"Re-sync Local":"Link Local"}</button><button class="btn-outline" data-action="create-branch-invoice" data-org-id="${esc(org.id)}" data-branch-id="${esc(branch.id)}"><i class="fa-solid fa-file-invoice-dollar"></i> Create invoice</button></div></div>
+          <div class="branch-workspace-meta"><div><small>LOCAL DASHBOARD</small><strong>${isCurrentLinked?(_lastLocalIntegrationStatus.connected?"Connected":"Disconnected"):"Not Linked"}</strong></div><div><small>LOCAL INSTANCE</small><strong class="mono" style="font-size:.78rem">${isCurrentLinked?(_lastLocalIntegrationStatus.local_instance_id||"—"):"None"}</strong></div><div><small>TOTAL EMPLOYEES</small><strong>${Number(branch.employeeCount||0)}</strong></div><div><small>BRANCH ACCESS</small><strong>${esc(access)}</strong></div></div>
           <div class="organization-profile-grid"><div class="organization-profile-field"><small>Branch contact person</small><strong>${esc(branch.contact&&branch.contact.name||"Contact not configured")}</strong></div><div class="organization-profile-field"><small>Contact role</small><strong>${esc(branch.contact&&branch.contact.role||"Not configured")}</strong></div><div class="organization-profile-field"><small>Contact phone</small><strong>${branch.contact&&branch.contact.phone?`<a href="tel:${esc(branch.contact.phone)}">${esc(branch.contact.phone)}</a>`:"Not configured"}</strong></div><div class="organization-profile-field"><small>Contact email</small><strong>${branch.contact&&branch.contact.email?`<a href="mailto:${esc(branch.contact.email)}">${esc(branch.contact.email)}</a>`:"Not provided"}</strong></div><div class="organization-profile-field"><small>Branch ID</small><strong class="mono">${esc(branch.id)}</strong></div><div class="organization-profile-field"><small>Parent organization</small><strong>${esc(org.name)} · ${esc(org.tokenId)}</strong></div><div class="organization-profile-field"><small>Branch key</small><strong class="mono">${esc(branch.tokenKey)}</strong><button class="btn-outline" data-action="copy-branch-token" data-id="${esc(org.id)}" data-branch-id="${esc(branch.id)}"><i class="fa-solid fa-copy"></i> Copy branch key</button></div><div class="organization-profile-field"><small>Key expiry</small><strong>${org.tokenExpiresAt?date(org.tokenExpiresAt):"Inherits organization key; expiry not configured"}</strong><small class="organization-key-reference">Parent key: ${esc(branch.tokenParentId)}</small></div></div>
-          <p class="branch-access-note">${suspension&&branch.access==="Suspended"?`Suspended ${suspension.days?"for "+suspension.days+" days":"permanently"}${temporaryEnd?` through ${temporaryEnd}`:""}. Access remains suspended until manually reactivated.`:access!=="Active"?`Branch access is blocked because ${esc(access.toLowerCase())}. Reactivate the organization or renew its key to restore eligible branches.`:"Branch is active under the organization license."}</p>
+          <p class="branch-access-note">${connectionNote} ${suspension&&branch.access==="Suspended"?`Suspended ${suspension.days?"for "+suspension.days+" days":"permanently"}${temporaryEnd?` through ${temporaryEnd}`:""}. Access remains suspended until manually reactivated.`:access!=="Active"?`Branch access is blocked because ${esc(access.toLowerCase())}. Reactivate the organization or renew its key to restore eligible branches.`:"Branch is active under the organization license."}</p>
           <div class="card-head" style="padding:14px 0 10px"><h2 style="font-size:1rem;margin:0">Branch invoices</h2><span class="badge${openInvoices.length?" pending":""}">${openInvoices.length} outstanding · ${money(outstandingBalance)} due</span></div><div class="branch-invoice-summary"><span>${linkedInvoices.length} invoice${linkedInvoices.length===1?"":"s"} total</span><span>${money(branchPaid)} recorded paid · demo payments unverified</span></div>${invoiceRows||'<div class="empty" style="padding:18px">No invoices for this branch yet.</div>'}
         </article>`;
       }).join("");
@@ -365,11 +539,24 @@
       const form=document.getElementById("tokenRotateForm");
       form.addEventListener("input",event=>{if(event.target.name==="expiresAt")syncTokenDuration();else if(event.target.name==="startsAt"||event.target.name==="validityDays")syncTokenExpiry()});
       form.addEventListener("change",event=>{if(event.target.name==="expiresAt")syncTokenDuration();else if(event.target.name==="startsAt"||event.target.name==="validityDays")syncTokenExpiry()});
-      form.addEventListener("submit",event=>{
+      form.addEventListener("submit",async event=>{
         event.preventDefault();const data=new FormData(form),startsAt=String(data.get("startsAt")),expiresAt=String(data.get("expiresAt")),validityDays=Number(data.get("validityDays")),calculatedDays=inclusiveDaysBetween(startsAt,expiresAt);
         if(!form.reportValidity())return;
         if(!startsAt||!expiresAt||calculatedDays<1||validityDays!==calculatedDays){notify("Set a valid start date, expiry date, and matching validity duration.",true);return}
-        org.tokenKey=createToken();org.tokenStartedAt=startsAt;org.tokenExpiresAt=expiresAt;org.tokenValidityDays=validityDays;org.branches.forEach(branch=>{branch.tokenParentId=org.tokenId;branch.tokenStartedAt=startsAt;branch.tokenExpiresAt=expiresAt});org.updatedAt=new Date().toISOString();record(`Client token rotated for ${org.name}; valid ${date(startsAt)} through ${date(expiresAt)}`);save();closeModal();render();notify("Organization and branch key validity dates saved.");
+        try{
+          const newTokenKey=createToken();
+          await fetch(`/api/organizations/${encodeURIComponent(org.id)}/rotate-token`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({startsAt,expiresAt,validityDays,tokenKey:newTokenKey})
+          });
+          record(`Client token rotated for ${org.name}; valid ${date(startsAt)} through ${date(expiresAt)}`,org.id);
+          await reloadData();
+          closeModal();
+          notify("Organization and branch key validity dates saved.");
+        }catch(err){
+          notify("Failed to rotate token: "+err.message,true);
+        }
       });
     }
     function renderActivity(){document.getElementById("activityFeed").innerHTML=activity.length?activity.map(item=>`<div style="padding:10px 0;border-bottom:1px solid #eaf2f6"><div style="font-size:.76rem;color:#416174">${esc(item.message)}</div><small style="color:#94a3b8">${date(item.at)}</small></div>`).join(""):`<div class="empty">Activity will appear here.</div>`}
@@ -384,10 +571,45 @@
     function updateWizardReview(){const summary=document.getElementById("reviewSummary");if(!summary)return;const branches=[...document.querySelectorAll(".branch-name")].filter(input=>input.value.trim()).length;const nameInput=document.querySelector("#organizationForm [name=name]");const name=nameInput?nameInput.value:"New organization";summary.textContent=`${esc(name)} will have ${branches} branch${branches===1?"":"es"} configured.`}
     function addBranch(){document.getElementById("branchList").insertAdjacentHTML("beforeend",branchRow({name:""}));updateWizardReview()}
     function wireModulePicker(){document.querySelectorAll("[data-module]").forEach(card=>card.addEventListener("click",()=>{const input=card.querySelector("input");if(input.disabled)return;input.checked=!input.checked;card.classList.toggle("selected",input.checked);document.getElementById("selectedCount").textContent=document.querySelectorAll("#formModules input:checked").length}))}
-    function saveOrganization(event){event.preventDefault();if(!validateStep(3)){notify("Select at least one module.",true);return}const data=new FormData(event.target),modules=[...document.querySelectorAll("#formModules input:checked")].map(input=>input.value),previous=event.target.dataset.id&&organizations.find(org=>org.id===event.target.dataset.id),branches=[...document.querySelectorAll(".branch-row")].map(row=>{const branchId=row.dataset.branchId||createBranchId(),oldBranch=previous&&previous.branches.find(item=>item.id===branchId)||{};return {id:branchId,name:row.querySelector(".branch-name").value.trim(),city:row.querySelector(".branch-city").value.trim(),address:row.querySelector(".branch-address").value.trim(),contact:{name:row.querySelector(".branch-contact-name").value.trim(),phone:row.querySelector(".branch-contact-phone").value.trim(),role:row.querySelector(".branch-contact-role").value.trim(),email:row.querySelector(".branch-contact-email").value.trim()},access:oldBranch.access||"Active",suspension:oldBranch.suspension||null,graceDays:oldBranch.graceDays===undefined?7:oldBranch.graceDays,employeeCount:Number(row.querySelector(".branch-employee-count").value)||0,tokenKey:oldBranch.tokenKey||createToken(),tokenParentId:previous?previous.tokenId:"",tokenStartedAt:previous?previous.tokenStartedAt:"",tokenExpiresAt:previous?previous.tokenExpiresAt:""}});if(!modules.length){notify("Select at least one module.",true);return}const existing=event.target.dataset.id,old=existing?organizations.find(org=>org.id===existing):null,orgRecord={id:existing||`ORG-${String(Date.now()).slice(-6)}`,name:data.get("name").trim(),industry:data.get("industry").trim(),email:data.get("email").trim(),phone:data.get("phone").trim(),address:data.get("address").trim(),branches,employeeCount:branches.reduce((sum,branch)=>sum+branch.employeeCount,0),tokenId:old&&old.tokenId?old.tokenId:createOrganizationKeyId(),tokenKey:old&&old.tokenKey?old.tokenKey:createToken(),tokenStartedAt:old&&old.tokenStartedAt||"",tokenExpiresAt:old&&old.tokenExpiresAt||"",tokenValidityDays:old&&old.tokenValidityDays||30,branding:{logo:String(data.get("logo")||"").trim(),appTitle:String(data.get("appTitle")||"").trim()||data.get("name").trim()+" Application"},status:old&&old.status?old.status:"Active",modules,createdAt:old&&old.createdAt?old.createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};const index=organizations.findIndex(org=>org.id===orgRecord.id);if(index>=0)organizations[index]=orgRecord;else organizations.unshift(orgRecord);normalizeOrg(orgRecord);record("Organization "+(existing?"updated: ":"created: ")+orgRecord.name);save();closeModal();render();notify("Organization saved successfully.");showPage("organizations")}
+    async function saveOrganization(event){
+      event.preventDefault();if(!validateStep(3)){notify("Select at least one module.",true);return}
+      const data=new FormData(event.target),modules=[...document.querySelectorAll("#formModules input:checked")].map(input=>input.value),previous=event.target.dataset.id&&organizations.find(org=>org.id===event.target.dataset.id),branches=[...document.querySelectorAll(".branch-row")].map(row=>{const branchId=row.dataset.branchId||createBranchId(),oldBranch=previous&&previous.branches.find(item=>item.id===branchId)||{};return {id:branchId,name:row.querySelector(".branch-name").value.trim(),city:row.querySelector(".branch-city").value.trim(),address:row.querySelector(".branch-address").value.trim(),contact:{name:row.querySelector(".branch-contact-name").value.trim(),phone:row.querySelector(".branch-contact-phone").value.trim(),role:row.querySelector(".branch-contact-role").value.trim(),email:row.querySelector(".branch-contact-email").value.trim()},access:oldBranch.access||"Active",suspension:oldBranch.suspension||null,graceDays:oldBranch.graceDays===undefined?7:oldBranch.graceDays,employeeCount:Number(row.querySelector(".branch-employee-count").value)||0,tokenKey:oldBranch.tokenKey||createToken(),tokenParentId:previous?previous.tokenId:"",tokenStartedAt:previous?previous.tokenStartedAt:"",tokenExpiresAt:previous?previous.tokenExpiresAt:""}});
+      if(!modules.length){notify("Select at least one module.",true);return}
+      const existing=event.target.dataset.id,old=existing?organizations.find(org=>org.id===existing):null,orgRecord={id:existing||`ORG-${String(Date.now()).slice(-6)}`,name:data.get("name").trim(),industry:data.get("industry").trim(),email:data.get("email").trim(),phone:data.get("phone").trim(),address:data.get("address").trim(),branches,employeeCount:branches.reduce((sum,branch)=>sum+branch.employeeCount,0),tokenId:old&&old.tokenId?old.tokenId:createOrganizationKeyId(),tokenKey:old&&old.tokenKey?old.tokenKey:createToken(),tokenStartedAt:old&&old.tokenStartedAt||"",tokenExpiresAt:old&&old.tokenExpiresAt||"",tokenValidityDays:old&&old.tokenValidityDays||30,branding:{logo:String(data.get("logo")||"").trim(),appTitle:String(data.get("appTitle")||"").trim()||data.get("name").trim()+" Application"},status:old&&old.status?old.status:"Active",modules,createdAt:old&&old.createdAt?old.createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+      try{
+        const url=existing?`/api/organizations/${encodeURIComponent(existing)}`:"/api/organizations";
+        const method=existing?"PUT":"POST";
+        const res=await fetch(url,{method,headers:{"Content-Type":"application/json"},body:JSON.stringify(orgRecord)});
+        if(!res.ok)throw new Error("HTTP "+res.status);
+        record("Organization "+(existing?"updated: ":"created: ")+orgRecord.name,orgRecord.id);
+        await reloadData();
+        closeModal();
+        render();
+        notify("Organization saved successfully.");
+        showPage("organizations");
+      }catch(err){
+        notify("Failed to save organization: "+err.message,true);
+      }
+    }
     function openDetails(id){if(!organizations.some(org=>org.id===id))return;selectedOrganizationId=id;showPage("organization-detail")}
     function confirmOrganizationDelete(id){const org=organizations.find(item=>item.id===id);if(!org){notify("That organization could not be found.",true);return}pendingDeleteOrganizationId=id;openModal(`<h2><i class="fa-solid fa-triangle-exclamation" style="color:var(--danger)"></i> Delete organization?</h2><p>Delete <strong>${esc(org.name)}</strong> (${esc(org.id)}) from this browser's organization directory?</p><div class="summary"><strong>This cannot be undone.</strong> Its demo invoices and application build history will be kept as historical records.</div><div class="form-actions"><button class="btn-outline" data-action="close">Cancel</button><button class="btn-danger" data-action="confirm-delete-organization"><i class="fa-solid fa-trash"></i> Delete organization</button></div>`)}
-    function deleteOrganization(){const id=pendingDeleteOrganizationId,org=organizations.find(item=>item.id===id);if(!org){pendingDeleteOrganizationId="";closeModal();notify("That organization no longer exists.",true);return}organizations=organizations.filter(item=>item.id!==id);if(selectedOrganizationId===id)selectedOrganizationId="";pendingDeleteOrganizationId="";closeModal();record(`Organization deleted: ${org.name} (${org.id}); invoices and builds retained`);if(currentPage==="organization-detail")showPage("organizations");else render();notify("Organization deleted. Its demo invoices and build history were preserved.")}
+    async function deleteOrganization(){
+      const id=pendingDeleteOrganizationId,org=organizations.find(item=>item.id===id);
+      if(!org){pendingDeleteOrganizationId="";closeModal();notify("That organization no longer exists.",true);return}
+      try{
+        const res=await fetch(`/api/organizations/${encodeURIComponent(id)}`,{method:"DELETE"});
+        if(!res.ok)throw new Error("HTTP "+res.status);
+        if(selectedOrganizationId===id)selectedOrganizationId="";
+        pendingDeleteOrganizationId="";
+        closeModal();
+        record(`Organization deleted: ${org.name} (${org.id}); invoices and builds retained`,id);
+        await reloadData();
+        if(currentPage==="organization-detail")showPage("organizations");else render();
+        notify("Organization deleted. Its demo invoices and build history were preserved.");
+      }catch(err){
+        notify("Failed to delete organization: "+err.message,true);
+      }
+    }
     function openBranchAccess(orgId,branchId){
       const org=organizations.find(item=>item.id===orgId),branch=org&&org.branches.find(item=>item.id===branchId);
       if(!org||!branch){notify("That branch could not be found.",true);return}
@@ -412,23 +634,42 @@
         else if(event.target.name==="endsAt")syncBranchSuspensionDuration();
         if(event.target.name==="days"&&form.elements.preset.value!=="permanent")form.elements.preset.value=["2","4","7"].includes(form.elements.days.value)?form.elements.days.value:"custom";
       });
-      form.addEventListener("submit",event=>{
+      form.addEventListener("submit",async event=>{
         event.preventDefault();const data=new FormData(form),targetOrg=organizations.find(item=>item.id===form.dataset.orgId),targetBranch=targetOrg&&targetOrg.branches.find(item=>item.id===form.dataset.branchId);
         if(!targetOrg||!targetBranch){notify("That branch could not be found.",true);return}
         const permanent=String(data.get("preset"))==="permanent",startedAt=String(data.get("startsAt")),endsAt=permanent?"":String(data.get("endsAt")),days=permanent?0:inclusiveDaysBetween(startedAt,endsAt);
         if(!form.reportValidity())return;
         if(!startedAt||(!permanent&&(days<1||days>3650||days!==Number(data.get("days"))))){notify("Enter a valid suspension start date and a matching duration/end date.",true);return}
-        targetBranch.access="Suspended";targetBranch.suspension={kind:permanent?"permanent":"temporary",days,startedAt,endsAt};targetOrg.updatedAt=new Date().toISOString();
-        record(`${targetBranch.name} suspended ${permanent?"permanently":`for ${days} days, ${startedAt} through ${endsAt}`} (${targetOrg.name})`);
-        save();closeModal();render();notify("Branch access suspended. It will remain suspended until manually reactivated.");
+        try{
+          const suspension={kind:permanent?"permanent":"temporary",days,startedAt,endsAt};
+          await fetch(`/api/organizations/${encodeURIComponent(targetOrg.id)}/branches/${encodeURIComponent(targetBranch.id)}/access`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({access:"Suspended",suspension})
+          });
+          record(`${targetBranch.name} suspended ${permanent?"permanently":`for ${days} days, ${startedAt} through ${endsAt}`} (${targetOrg.name})`,targetOrg.id,targetBranch.id);
+          await reloadData();
+          closeModal();
+          notify("Branch access suspended. It will remain suspended until manually reactivated.");
+        }catch(err){
+          notify("Failed to suspend branch: "+err.message,true);
+        }
       });
     }
-    function reactivateBranch(orgId,branchId){
+    async function reactivateBranch(orgId,branchId){
       const org=organizations.find(item=>item.id===orgId),branch=org&&org.branches.find(item=>item.id===branchId);
       if(!org||!branch){notify("That branch could not be found.",true);return}
       if(org.status!=="Active"||["Expired","Not active yet"].includes(organizationKeyState(org))){notify("Reactivate the organization and make sure its license key is valid first.",true);return}
       if(branchHasOutstandingInvoices(org.id,branch.id)){notify("This branch has outstanding invoices. Settle them before reactivating access.",true);return}
-      branch.access="Active";branch.suspension=null;org.updatedAt=new Date().toISOString();record(`${branch.name} reactivated (${org.name})`);save();closeModal();render();notify("Branch access reactivated.");
+      try{
+        await fetch(`/api/organizations/${encodeURIComponent(orgId)}/branches/${encodeURIComponent(branchId)}/reactivate`,{method:"POST"});
+        record(`${branch.name} reactivated (${org.name})`,org.id,branch.id);
+        await reloadData();
+        closeModal();
+        notify("Branch access reactivated.");
+      }catch(err){
+        notify("Failed to reactivate branch: "+err.message,true);
+      }
     }
     function copyBranchToken(orgId,branchId){
       const org=organizations.find(item=>item.id===orgId),branch=org&&org.branches.find(item=>item.id===branchId);
@@ -436,14 +677,19 @@
       if(!navigator.clipboard){notify("Copy is unavailable in this browser.",true);return}
       navigator.clipboard.writeText(branch.tokenKey).then(()=>notify("Branch key copied.")).catch(()=>notify("Copy is unavailable in this browser.",true));
     }
-    function setOrganizationStatus(id){
+    async function setOrganizationStatus(id){
       const org=organizations.find(item=>item.id===id);
       if(!org){notify("That organization could not be found.",true);return}
       if(org.status!=="Active"&&["Expired","Not active yet"].includes(organizationKeyState(org))){notify("Renew the organization key before reactivating the organization.",true);return}
-      org.status=org.status==="Active"?"Inactive":"Active";
-      org.updatedAt=new Date().toISOString();
-      record(`${org.name} ${org.status.toLowerCase()}`);
-      save();render();notify("Organization status updated. Branch access follows the organization status.");
+      try{
+        await fetch(`/api/organizations/${encodeURIComponent(id)}/toggle`,{method:"POST"});
+        const newStatus=org.status==="Active"?"inactive":"active";
+        record(`${org.name} ${newStatus}`,id);
+        await reloadData();
+        notify("Organization status updated. Branch access follows the organization status.");
+      }catch(err){
+        notify("Failed to update status: "+err.message,true);
+      }
     }
     function buildBranchOptions(org,selectedBranchId=""){return `<option value="">Choose a branch</option>${org?org.branches.map(branch=>`<option value="${esc(branch.id)}" ${branch.id===selectedBranchId?"selected":""}>${esc(branch.name)} · ${Number(branch.employeeCount||0)} employees</option>`).join(""):""}`}
     function openBuildForm(id="",branchId=""){
@@ -459,15 +705,41 @@
       branchSelect.addEventListener("change",update);document.getElementById("buildFormAppName").addEventListener("input",update);update();document.getElementById("buildForm").addEventListener("submit",startBuild)
     }
     function nextBuildVersion(organizationId,branchId,appName){const versions=builds.filter(build=>build.organizationId===organizationId&&(build.branchId||"")===(branchId||"")&&String(build.appName||"").toLowerCase()===appName.toLowerCase()).map(build=>buildVersionNumber(build.version));const patch=versions.reduce((max,version)=>Math.max(max,version[0]===1&&version[1]===0?version[2]:0),0)+1;return `v1.0.${patch}`}
-    function startBuild(event){
+    async function startBuild(event){
       event.preventDefault();const form=new FormData(event.target),org=organizations.find(item=>item.id===form.get("organizationId")),targetValue=String(form.get("branchId")||""),branch=org&&org.branches.find(item=>item.id===targetValue),appName=String(form.get("appName")||"").trim();
       if(!org||org.status!=="Active"){notify("Choose an active organization first.",true);return}
       if(!branch){notify("Choose a branch for this build.",true);return}
       if(effectiveBranchAccess(org,branch)!=="Active"){notify("Choose an active branch before starting a build.",true);return}
       if(!appName){notify("Enter an application name.",true);return}
       const build={id:`BUILD-${String(Date.now()).slice(-8)}`,organizationId:org.id,organizationName:org.name,branchId:branch.id,branchName:branch.name,appName,version:nextBuildVersion(org.id,branch.id,appName),modules:org.modules.slice(),status:"queued",progress:0,createdAt:new Date().toISOString()};
-      builds.unshift(build);record(`Build ${build.version} queued for ${org.name} · ${branch.name}`);save();closeModal();showPage("organization-build-history");notify("Branch build queued. Progress is simulated for frontend testing.");
-      const timer=setInterval(()=>{const current=builds.find(item=>item.id===build.id);if(!current){clearInterval(timer);return}current.status=current.progress<20?"queued":"building";current.progress=Math.min(100,current.progress+Math.floor(Math.random()*20)+8);if(current.progress>=100){current.status="succeeded";record(`Build ${current.version} completed for ${org.name} · ${branch.name}`);notify("Build completed successfully.");clearInterval(timer)}save();render()},650)
+      try{
+        await fetch("/api/builds",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(build)});
+        record(`Build ${build.version} queued for ${org.name} · ${branch.name}`,org.id,branch.id);
+        await reloadData();
+        closeModal();
+        showPage("organization-build-history");
+        notify("Branch build queued. Progress is simulated for testing.");
+        const timer=setInterval(async()=>{
+          const current=builds.find(item=>item.id===build.id);
+          if(!current){clearInterval(timer);return}
+          current.status=current.progress<20?"queued":"building";
+          current.progress=Math.min(100,current.progress+Math.floor(Math.random()*20)+8);
+          if(current.progress>=100){
+            current.status="succeeded";
+            record(`Build ${current.version} completed for ${org.name} · ${branch.name}`,org.id,branch.id);
+            notify("Build completed successfully.");
+            clearInterval(timer);
+          }
+          await fetch(`/api/builds/${encodeURIComponent(current.id)}`,{
+            method:"PUT",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({status:current.status,progress:current.progress})
+          }).catch(()=>{});
+          render();
+        },650);
+      }catch(err){
+        notify("Failed to queue build: "+err.message,true);
+      }
     }
     function downloadMock(id){const build=builds.find(item=>item.id===id);if(!build||build.status!=="succeeded")return;const manifest={notice:"Frontend demo artifact; not an executable.",build:{...build,organizationName:build.organizationName||"Removed organization",branchName:build.branchName||"Branch not assigned"},downloadedAt:new Date().toISOString()};const blob=new Blob([JSON.stringify(manifest,null,2)],{type:"application/json"});const link=document.createElement("a");link.href=URL.createObjectURL(blob);link.download=`${build.appName.replace(/[^\w-]+/g,"-")}-${build.version}-${build.id}.json`;link.click();URL.revokeObjectURL(link.href);notify("Demo build manifest downloaded.")}
     function buildHistoryRows(history){
@@ -479,14 +751,71 @@
       if(!org){const history=builds.filter(build=>build.organizationId===orgId);openModal(`<h2><i class="fa-solid fa-clock-rotate-left" style="color:#3d9fd4"></i> ${esc(historicalName)} · Build history</h2><div class="summary">This organization was removed. Its build history is preserved as a historical record.</div>${buildHistoryRows(history.slice().sort((a,b)=>compareBuildVersions(a,b)||((Date.parse(b.createdAt)||0)-(Date.parse(a.createdAt)||0))))}<div class="form-actions"><button class="btn-outline" data-action="close">Close</button></div>`);return}
       selectedBuildHistoryOrg=org.id;document.getElementById("buildSearch").value="";document.getElementById("buildFilter").value="all";document.getElementById("buildBranchFilter").value=branchId||"all";document.getElementById("buildSort").value="created-desc";showPage("organization-build-history")
     }
-    function openBuildDetails(id){const build=builds.find(item=>item.id===id);if(!build)return;const org=organizations.find(item=>item.id===build.organizationId);openModal(`<h2><i class="fa-solid fa-box" style="color:#3d9fd4"></i> ${esc(build.version||"Build details")} · ${esc(build.id)}</h2><div class="build-detail-grid"><div><small>Organization</small><strong>${esc(org?org.name:build.organizationName||"Removed organization")}</strong></div><div><small>Branch</small><strong>${esc(build.branchName||"Branch not assigned")}</strong></div><div><small>Application</small><strong>${esc(build.appName)}</strong></div><div><small>Status</small><strong>${statusBadge(build.status)}</strong></div><div><small>Created</small><strong>${build.createdAt?new Date(build.createdAt).toLocaleString():"—"}</strong></div><div><small>Progress</small><strong>${Math.max(0,Math.min(100,Number(build.progress)||0))}%</strong></div></div><div class="summary"><strong>Modules in this version:</strong><br>${(build.modules||[]).map(moduleName).map(esc).join(", ")||"No module snapshot recorded for this legacy build."}</div><div class="form-actions"><button class="btn-outline" data-action="close">Close</button>${build.status==="succeeded"?`<button class="btn-primary" data-action="download" data-id="${esc(build.id)}"><i class="fa-solid fa-download"></i> Download manifest</button>`:""}</div>`)}
+    function openBuildDetails(id){
+      const build=builds.find(item=>item.id===id);if(!build)return;
+      const org=organizations.find(item=>item.id===build.organizationId);
+      const branch=org&&org.branches.find(b=>b.id===build.branchId);
+      const branchKey = (branch&&branch.tokenKey)||(org&&org.tokenKey)||"QE-9A5DDEE7B01A41C18B2F";
+      const clientUrl = "http://127.0.0.1:5000";
+      const defaultUser = org ? (org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`) : "admin@client.com";
+      const defaultPass = "Pass1234!";
+
+      openModal(`
+        <h2><i class="fa-solid fa-rocket" style="color:#3d9fd4"></i> Client Application & Credentials</h2>
+        <p><strong>${esc(org?org.name:build.organizationName)}</strong> · ${esc(build.branchName||"Main Branch")}</p>
+        
+        <div class="build-detail-grid" style="margin-bottom:18px;">
+          <div><small>Application Version</small><strong>${esc(build.version||"v1.0.0")}</strong></div>
+          <div><small>Build Status</small><strong>${statusBadge(build.status)}</strong></div>
+          <div><small>Branch Key</small><strong class="mono" style="color:#3d9fd4;font-size:0.85rem;">${esc(branchKey)}</strong></div>
+          <div><small>Client Portal Link</small><strong><a href="${clientUrl}" target="_blank" style="color:#0284c7;text-decoration:underline;">${clientUrl}</a></strong></div>
+        </div>
+
+        <div style="background:#f8fafc; border:1px solid #dbe5ec; border-radius:12px; padding:16px; margin-bottom:18px;">
+          <h4 style="margin:0 0 10px; font-size:0.95rem; font-weight:800; color:#173042;">
+            <i class="fa-solid fa-key" style="color:#3d9fd4; margin-right:6px;"></i> Client Login Credentials
+          </h4>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:8px;">
+            <div>
+              <small style="color:#64748b; font-weight:700;">Client Username / Email:</small>
+              <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; margin-top:4px;">${esc(defaultUser)}</div>
+            </div>
+            <div>
+              <small style="color:#64748b; font-weight:700;">Client Password:</small>
+              <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; margin-top:4px;">${esc(defaultPass)}</div>
+            </div>
+          </div>
+          <small style="color:#64748b;">Give these credentials to the client. When they sign in, they will only see their purchased modules (${(build.modules||[]).map(moduleName).map(esc).join(", ")}).</small>
+        </div>
+
+        <div class="summary">
+          <strong>Standalone AI Node Setup:</strong> Give the client the <strong>Branch Key</strong> above. They enter it in their AI Attendance application to connect cameras and start marking attendance.
+        </div>
+
+        <div class="form-actions" style="margin-top:20px;">
+          <button class="btn-outline" data-action="close">Close</button>
+          <a href="${clientUrl}" target="_blank" class="btn-primary" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px;">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Open Client Dashboard
+          </a>
+        </div>
+      `);
+    }
     function confirmBuildDelete(id){
       const build=builds.find(item=>item.id===id);if(!build){notify("That build could not be found.",true);return}
       openModal(`<h2><i class="fa-solid fa-trash" style="color:#c55252"></i> Delete build history?</h2><div class="summary">Delete <strong>${esc(build.version||"Version unavailable")} · ${esc(build.id)}</strong> for ${esc(build.organizationName||"this organization")} / ${esc(build.branchName||"Branch not assigned")}? This removes the build record from local history and cannot be undone.</div><div class="form-actions"><button class="btn-outline" data-action="close">Cancel</button><button class="btn-danger" data-action="confirm-delete-build" data-id="${esc(build.id)}"><i class="fa-solid fa-trash"></i> Delete build</button></div>`)
     }
-    function deleteBuild(id){
-      const index=builds.findIndex(item=>item.id===id);if(index<0){notify("That build could not be found.",true);return}
-      const [removed]=builds.splice(index,1);record(`Build ${removed.version||removed.id} deleted from build history`);save();closeModal();render();notify("Build history record deleted.")
+    async function deleteBuild(id){
+      const build=builds.find(item=>item.id===id);if(!build){notify("That build could not be found.",true);return}
+      try{
+        await fetch(`/api/builds/${encodeURIComponent(id)}`,{method:"DELETE"});
+        record(`Build ${build.version||build.id} deleted from build history`,build.organizationId,build.branchId);
+        await reloadData();
+        closeModal();
+        render();
+        notify("Build history record deleted.");
+      }catch(err){
+        notify("Failed to delete build: "+err.message,true);
+      }
     }
     function assignLegacyBuildToBranch(id){
       const build=builds.find(item=>item.id===id),org=build&&organizations.find(item=>item.id===build.organizationId);
@@ -494,11 +823,25 @@
       if(build.branchId&&org.branches.some(branch=>branch.id===build.branchId)){notify("This build is already assigned to a branch.",true);return}
       if(!org.branches.length){notify("Add a branch to this organization before assigning the build.",true);return}
       openModal(`<h2><i class="fa-solid fa-code-branch" style="color:#3d9fd4"></i> Assign legacy build to branch</h2><p><strong>${esc(build.version||"Version unavailable")} · ${esc(build.appName)}</strong></p><div class="summary">Choose the branch this older build belongs to. Its version will be placed next in that branch's version sequence.</div><form id="legacyBuildAssignmentForm" data-build-id="${esc(build.id)}"><label for="legacyBuildBranch">Branch *</label><select class="form-control" id="legacyBuildBranch" name="branchId" required><option value="">Choose branch</option>${buildBranchOptions(org)}</select><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Assign to branch</button></div></form>`);
-      document.getElementById("legacyBuildAssignmentForm").addEventListener("submit",event=>{
+      document.getElementById("legacyBuildAssignmentForm").addEventListener("submit",async event=>{
         event.preventDefault();const form=event.currentTarget,currentBuild=builds.find(item=>item.id===form.dataset.buildId),currentOrg=currentBuild&&organizations.find(item=>item.id===currentBuild.organizationId),branch=currentOrg&&currentOrg.branches.find(item=>item.id===new FormData(form).get("branchId"));
         if(!currentBuild||!currentOrg||!branch){notify("Choose a valid branch for this build.",true);return}
-        currentBuild.version=nextBuildVersion(currentOrg.id,branch.id,currentBuild.appName);currentBuild.branchId=branch.id;currentBuild.branchName=branch.name;record(`Legacy build ${currentBuild.id} assigned to ${currentOrg.name} · ${branch.name}`);save();closeModal();render();notify("Legacy build assigned to the branch.")
-      })
+        const newVersion=nextBuildVersion(currentOrg.id,branch.id,currentBuild.appName);
+        try{
+          await fetch(`/api/builds/${encodeURIComponent(currentBuild.id)}`,{
+            method:"PUT",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({branchId:branch.id,branchName:branch.name,version:newVersion})
+          });
+          record(`Legacy build ${currentBuild.id} assigned to ${currentOrg.name} · ${branch.name}`,currentOrg.id,branch.id);
+          await reloadData();
+          closeModal();
+          render();
+          notify("Legacy build assigned to the branch.");
+        }catch(err){
+          notify("Failed to assign build: "+err.message,true);
+        }
+      });
     }
     function openInvoiceBranchAssignment(id){
       const invoice=invoices.find(item=>item.id===id),org=invoice&&organizations.find(item=>item.id===invoice.organizationId);
@@ -506,26 +849,116 @@
       if(org.branches.some(branch=>branch.id===invoice.branchId)){notify("This invoice is already assigned to a branch.",true);return}
       if(!org.branches.length){notify("Add a branch to this organization before assigning the invoice.",true);return}
       openModal(`<h2><i class="fa-solid fa-code-branch" style="color:#3d9fd4"></i> Assign invoice to a branch</h2><p><strong>${esc(invoice.number)}</strong> · ${esc(org.name)}</p><div class="summary">The invoice balance will be included in the selected branch’s billing and outstanding-invoice access checks.</div><form id="invoiceBranchAssignmentForm" data-invoice-id="${esc(invoice.id)}"><label for="invoiceBranchAssignment">Branch *</label><select class="form-control" id="invoiceBranchAssignment" name="branchId" required><option value="">Choose branch</option>${invoiceBranchOptions(org.id)}</select><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Assign invoice</button></div></form>`);
-      document.getElementById("invoiceBranchAssignmentForm").addEventListener("submit",event=>{
+      document.getElementById("invoiceBranchAssignmentForm").addEventListener("submit",async event=>{
         event.preventDefault();
         const form=event.currentTarget,branchId=new FormData(form).get("branchId"),currentInvoice=invoices.find(item=>item.id===form.dataset.invoiceId),currentOrg=currentInvoice&&organizations.find(item=>item.id===currentInvoice.organizationId),branch=currentOrg&&currentOrg.branches.find(item=>item.id===branchId);
         if(!currentInvoice||!currentOrg||!branch){notify("Choose a valid branch for this invoice.",true);return}
         if(currentOrg.branches.some(item=>item.id===currentInvoice.branchId)){notify("This invoice has already been assigned to a branch.",true);closeModal();render();return}
-        currentInvoice.branchId=branch.id;currentInvoice.branchName=branch.name;currentInvoice.organizationName=currentOrg.name;currentInvoice.updatedAt=new Date().toISOString();
-        currentOrg.updatedAt=new Date().toISOString();record(`Invoice ${currentInvoice.number} assigned to ${branch.name} (${currentOrg.name})`);
-        save();closeModal();render();notify("Invoice assigned to the branch. Its balance is now included in branch billing.");
+        try{
+          await fetch(`/api/invoices/${encodeURIComponent(currentInvoice.id)}`,{
+            method:"PUT",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({branchId:branch.id,branchName:branch.name,organizationName:currentOrg.name})
+          });
+          record(`Invoice ${currentInvoice.number} assigned to ${branch.name} (${currentOrg.name})`,currentOrg.id,branch.id);
+          await reloadData();
+          closeModal();
+          render();
+          notify("Invoice assigned to the branch. Its balance is now included in branch billing.");
+        }catch(err){
+          notify("Failed to assign invoice: "+err.message,true);
+        }
       });
     }
     function invoiceBranchOptions(orgId,selectedBranchId=""){const org=organizations.find(item=>item.id===orgId);return org?org.branches.map(branch=>`<option value="${esc(branch.id)}" ${branch.id===selectedBranchId?"selected":""}>${esc(branch.name)} — ${Number(branch.employeeCount||0)} employees</option>`).join(""):""}
     function openInvoiceForm(orgId="",branchId=""){const selectedOrg=organizations.find(org=>org.id===orgId),initialBranch=selectedOrg&&selectedOrg.branches.some(branch=>branch.id===branchId)?branchId:"";openModal(`<h2><i class="fa-solid fa-file-invoice-dollar" style="color:#3d9fd4"></i> Create Branch Invoice</h2><form id="invoiceForm"><div class="form-grid"><div class="form-group"><label>Organization *</label><select class="form-control" name="organizationId" required><option value="">Choose organization</option>${organizations.map(org=>`<option value="${esc(org.id)}" ${org.id===orgId?"selected":""}>${esc(org.name)}</option>`).join("")}</select></div><div class="form-group"><label>Branch *</label><select class="form-control" name="branchId" required ${selectedOrg?"":"disabled"}><option value="">${selectedOrg?"Choose branch":"Choose an organization first"}</option>${invoiceBranchOptions(orgId,initialBranch)}</select></div><div class="form-group"><label>Invoice status</label><select class="form-control" name="status"><option>Unpaid</option><option>Draft</option></select></div><div class="form-group"><label>Issue date *</label><input class="form-control" name="issueDate" type="date" value="${localDateValue()}" required></div><div class="form-group"><label>Due date *</label><input class="form-control" name="dueDate" type="date" value="${localDateValue(new Date(Date.now()+14*86400000))}" required></div><div class="form-group"><label>Tax rate (%)</label><input class="form-control" name="taxRate" type="number" min="0" max="100" value="0"></div><div class="form-group"><label>Discount</label><input class="form-control" name="discount" type="number" min="0" step=".01" value="0"></div><div class="form-group full"><label>Line items (one per line: description | quantity | unit price)</label><textarea class="form-control" name="items" rows="4" placeholder="Attendance subscription | 1 | 99&#10;Setup fee | 1 | 25" required>Subscription | 1 | 99</textarea><div id="invoiceLiveTotals" class="invoice-live"></div></div><div class="form-group full"><label>Payment terms / notes</label><textarea class="form-control" name="notes" rows="2" placeholder="Payment is due by the due date."></textarea></div></div><div class="summary">This invoice is assigned to one branch. Its outstanding balance is tracked against that branch’s access. Manual payment records are marked <strong>unverified</strong> in this frontend demo.</div><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Create Invoice</button></div></form>`);const invoiceForm=document.getElementById("invoiceForm");invoiceForm.elements.organizationId.addEventListener("change",()=>{const branchSelect=invoiceForm.elements.branchId;branchSelect.innerHTML=`<option value="">Choose branch</option>${invoiceBranchOptions(invoiceForm.elements.organizationId.value)}`;branchSelect.disabled=!invoiceForm.elements.organizationId.value});invoiceForm.addEventListener("submit",saveInvoice);invoiceForm.addEventListener("input",updateInvoiceDraft);updateInvoiceDraft()}
     function updateInvoiceDraft(){const form=document.getElementById("invoiceForm");if(!form)return;const lines=String(form.elements.items.value||"").split(/\n/).map(line=>line.split("|")).filter(parts=>parts.length>=3),subtotal=lines.reduce((sum,parts)=>sum+(Number(parts[1])||1)*(Number(parts[2])||0),0),discount=Number(form.elements.discount.value)||0,taxRate=Number(form.elements.taxRate.value)||0,tax=Math.max(0,subtotal-discount)*taxRate/100,total=Math.max(0,subtotal-discount+tax);document.getElementById("invoiceLiveTotals").innerHTML=`<div><small>Subtotal</small><strong>${money(subtotal)}</strong></div><div><small>Discount</small><strong>-${money(discount)}</strong></div><div><small>Tax</small><strong>${money(tax)}</strong></div><div><small>Total payable</small><strong>${money(total)}</strong></div>`}
-    function saveInvoice(event){event.preventDefault();const data=new FormData(event.target),org=organizations.find(item=>item.id===data.get("organizationId")),branch=org&&org.branches.find(item=>item.id===data.get("branchId"));if(!org){notify("Choose an organization.",true);return}if(!branch){notify("Choose a branch for this invoice.",true);return}const items=String(data.get("items")).split(/\n/).map(line=>line.split("|")).filter(parts=>parts.length>=3).map(parts=>({description:parts[0].trim(),quantity:Number(parts[1])||1,unitPrice:Number(parts[2])||0}));if(!items.length){notify("Add at least one valid line item.",true);return}const subtotal=items.reduce((sum,item)=>sum+item.quantity*item.unitPrice,0),discount=Number(data.get("discount"))||0,taxRate=Number(data.get("taxRate"))||0,tax=Math.max(0,subtotal-discount)*taxRate/100,total=Math.max(0,subtotal-discount+tax);const invoice={id:"INV-"+String(Date.now()).slice(-8),number:"QIN-"+new Date().getFullYear()+"-"+String(invoices.length+1).padStart(4,"0"),organizationId:org.id,organizationName:org.name,branchId:branch.id,branchName:branch.name,clientName:org.name,clientEmail:org.email,clientPhone:org.phone,billingAddress:org.address,taxDetails:"Not provided",issueDate:data.get("issueDate"),dueDate:data.get("dueDate"),items,subtotal,discount,taxRate,tax,total,paid:0,paymentMethod:"",payments:[],status:String(data.get("status")),notes:String(data.get("notes")||""),createdAt:new Date().toISOString()};invoices.unshift(invoice);record("Invoice "+invoice.number+" created for "+org.name+" / "+branch.name);save();closeModal();showPage("invoices");notify("Branch invoice created successfully.")}
+    async function saveInvoice(event){
+      event.preventDefault();const data=new FormData(event.target),org=organizations.find(item=>item.id===data.get("organizationId")),branch=org&&org.branches.find(item=>item.id===data.get("branchId"));
+      if(!org){notify("Choose an organization.",true);return}
+      if(!branch){notify("Choose a branch for this invoice.",true);return}
+      const items=String(data.get("items")).split(/\n/).map(line=>line.split("|")).filter(parts=>parts.length>=3).map(parts=>({description:parts[0].trim(),quantity:Number(parts[1])||1,unitPrice:Number(parts[2])||0}));
+      if(!items.length){notify("Add at least one valid line item.",true);return}
+      const subtotal=items.reduce((sum,item)=>sum+item.quantity*item.unitPrice,0),discount=Number(data.get("discount"))||0,taxRate=Number(data.get("taxRate"))||0,tax=Math.max(0,subtotal-discount)*taxRate/100,total=Math.max(0,subtotal-discount+tax);
+      const invoice={id:"INV-"+String(Date.now()).slice(-8),number:"QIN-"+new Date().getFullYear()+"-"+String(invoices.length+1).padStart(4,"0"),organizationId:org.id,organizationName:org.name,branchId:branch.id,branchName:branch.name,clientName:org.name,clientEmail:org.email,clientPhone:org.phone,billingAddress:org.address,taxDetails:"Not provided",issueDate:data.get("issueDate"),dueDate:data.get("dueDate"),items,subtotal,discount,taxRate,tax,total,paid:0,paymentMethod:"",payments:[],status:String(data.get("status")),notes:String(data.get("notes")||""),createdAt:new Date().toISOString()};
+      try{
+        await fetch("/api/invoices",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(invoice)});
+        record("Invoice "+invoice.number+" created for "+org.name+" / "+branch.name,org.id,branch.id);
+        await reloadData();
+        closeModal();
+        showPage("invoices");
+        notify("Branch invoice created successfully.");
+      }catch(err){
+        notify("Failed to save invoice: "+err.message,true);
+      }
+    }
     function invoicePaper(invoice){const status=invoiceStatus(invoice);return `<div class="invoice-paper" id="printInvoice"><header><div class="invoice-brand"><img src="${INVOICE_LOGO}" alt="QIntellect Technologies logo"><div><strong style="font-size:1.25rem">${COMPANY_DETAILS.name}</strong><div style="color:#247eae;font-size:.72rem;font-weight:800;letter-spacing:.5px">DRIVING THE FUTURE TECHNOLOGY POWERED BY QUANTUM &amp; AI</div><div>${COMPANY_DETAILS.phone} · ${COMPANY_DETAILS.email}</div><div class="mono">NTN: ${INVOICE_NTN}</div></div></div><div style="text-align:right"><h1 style="font-size:1.8rem;margin:0">INVOICE</h1><div class="mono">${esc(invoice.number)}</div><span class="badge">${esc(status)}</span></div></header><div class="invoice-meta"><div><small>Bill to</small><strong>${esc(invoice.clientName)}</strong><div>${esc(invoice.clientEmail||"")}</div></div><div><small>Invoice dates</small><strong>Issue date: ${date(invoice.issueDate)}</strong><div>Due date: ${date(invoice.dueDate)}</div></div></div><table><thead><tr><th>Description</th><th>Qty</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${invoice.items.map(item=>`<tr><td>${esc(item.description)}</td><td>${item.quantity}</td><td>${money(item.unitPrice)}</td><td>${money(item.quantity*item.unitPrice)}</td></tr>`).join("")}</tbody></table><div class="total"><div>Subtotal: ${money(invoice.subtotal)}</div><div>Discount: -${money(invoice.discount)}</div><div>Tax (${invoice.taxRate}%): ${money(invoice.tax)}</div><hr><strong>Total: ${money(invoice.total)}</strong><br>Paid: ${money(invoice.paid)}<br><strong>Balance due: ${money(invoiceBalance(invoice))}</strong></div><div class="bank-details"><small>Payment details</small><strong>Account Title:</strong> ${BANK_DETAILS.accountTitle}<br><strong>Bank Name:</strong> ${BANK_DETAILS.bankName}<br><strong>IBAN:</strong> ${BANK_DETAILS.iban}</div><p style="margin-top:22px;color:#628095">${esc(invoice.notes||"Payment is due by the due date.")}</p><div class="app-preview-footer" style="margin:32px -42px -42px">${FOOTER_TEXT}<br><strong>${FOOTER_POWERED}</strong></div></div>`}
     function printInvoice(invoice){const printWindow=window.open("","_blank","width=900,height=700");if(!printWindow){notify("Allow pop-ups to print the invoice.",true);return}printWindow.document.write(`<title>${esc(invoice.number)}</title><style>@page{size:A4;margin:14mm}body{font-family:Arial;margin:0;color:#173042}.invoice-paper{max-width:820px;margin:auto;padding:42px;border:1px solid #dcecf4}.invoice-paper header{display:flex;justify-content:space-between;border-bottom:2px solid #3d9fd4;padding-bottom:22px}.invoice-brand{display:flex;align-items:center;gap:14px}.invoice-brand img{width:76px;height:76px;object-fit:contain}.invoice-meta{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:24px 0;padding:18px 0;border-top:1px solid #dcecf4;border-bottom:1px solid #dcecf4}.invoice-meta small,.bank-details small{display:block;color:#628095;font-size:11px;font-weight:bold;text-transform:uppercase}.invoice-paper table{width:100%;border-collapse:collapse;margin-top:28px}.invoice-paper th,.invoice-paper td{text-align:left;padding:12px;border-bottom:1px solid #dcecf4}.total{margin:22px 0 0 auto;width:280px;line-height:1.8}.bank-details{margin-top:26px;padding:18px;border:1px solid #cfe8f7;background:#f5fbff}.app-preview-footer{margin-top:32px;padding:15px;background:#173042;color:#fff;font-size:12px}</style>${invoicePaper(invoice)}</body></html>`);printWindow.document.close();printWindow.focus();printWindow.print()}
     function openInvoiceDetails(id){const invoice=invoices.find(item=>item.id===id);if(!invoice)return;const org=organizations.find(item=>item.id===invoice.organizationId),needsBranchAssignment=Boolean(org&&!org.branches.some(branch=>branch.id===invoice.branchId));openModal(`<h2><i class="fa-solid fa-file-invoice-dollar" style="color:#3d9fd4"></i> ${esc(invoice.number)}</h2><div class="summary"><strong>Branch billing</strong><br>${esc(invoice.organizationName||invoice.clientName||"Organization unavailable")} · ${esc(invoice.branchName||"Legacy / unassigned branch")}</div>${invoicePaper(invoice)}<div class="summary"><strong>Payment history</strong>${invoice.payments&&invoice.payments.length?invoice.payments.map(payment=>`<div>${date(payment.date)} · ${money(payment.amount)} · ${esc(payment.method)} · <span class="badge pending">Unverified</span></div>`).join(""):"<div>No payments recorded.</div>"}</div><div class="form-actions"><button class="btn-outline" data-action="close">Close</button>${needsBranchAssignment?`<button class="btn-outline" data-action="assign-invoice-branch" data-id="${esc(invoice.id)}"><i class="fa-solid fa-code-branch"></i> Assign branch</button>`:""}<button class="btn-outline" data-action="edit-invoice" data-id="${esc(invoice.id)}">Edit details</button><button class="btn-outline" data-action="print-invoice" data-id="${esc(invoice.id)}">Print / Save PDF</button><button class="btn-primary" data-action="record-payment" data-id="${esc(invoice.id)}">Record payment</button></div>`)}
-    function openInvoiceEdit(id){const invoice=invoices.find(item=>item.id===id);if(!invoice)return;openModal(`<h2>Edit ${esc(invoice.number)}</h2><form id="invoiceEditForm"><label>Due date *</label><input class="form-control" name="dueDate" type="date" value="${esc(invoice.dueDate)}" required><label style="margin-top:14px">Invoice status</label><select class="form-control" name="status"><option ${invoice.status==="Draft"?"selected":""}>Draft</option><option ${invoice.status==="Cancelled"?"selected":""}>Cancelled</option><option ${invoice.status==="Unpaid"?"selected":""}>Unpaid</option></select><label style="margin-top:14px">Notes</label><textarea class="form-control" name="notes" rows="3">${esc(invoice.notes||"")}</textarea><div class="summary">Paid and outstanding totals are calculated from the payment history and cannot be manually overwritten.</div><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Save invoice details</button></div></form>`);document.getElementById("invoiceEditForm").addEventListener("submit",event=>{event.preventDefault();const data=new FormData(event.target);invoice.dueDate=data.get("dueDate");invoice.notes=String(data.get("notes")||"");invoice.status=String(data.get("status"));invoice.updatedAt=new Date().toISOString();save();closeModal();render();notify("Invoice details updated.")})}
-    function openPaymentForm(id){const invoice=invoices.find(item=>item.id===id);if(!invoice)return;openModal(`<h2>Record payment for ${esc(invoice.number)}</h2><div class="summary">Outstanding balance: <strong>${money(invoiceBalance(invoice))}</strong><br>Payments are manually recorded and remain <strong>unverified</strong>.</div><form id="paymentForm"><label>Amount *</label><input class="form-control" name="amount" type="number" min=".01" max="${invoiceBalance(invoice)}" step=".01" required><label style="margin-top:14px">Payment method</label><select class="form-control" name="method"><option>Bank transfer</option><option>Cash</option><option>Card</option><option>Other</option></select><label style="margin-top:14px">Transaction reference</label><input class="form-control" name="reference" maxlength="80"><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Save unverified payment</button></div></form>`);document.getElementById("paymentForm").addEventListener("submit",event=>{event.preventDefault();const data=new FormData(event.target),amount=Number(data.get("amount"));if(!amount||amount>invoiceBalance(invoice)){notify("Enter an amount within the outstanding balance.",true);return}invoice.paid=Number(invoice.paid||0)+amount;invoice.paymentMethod=data.get("method");invoice.payments=invoice.payments||[];invoice.payments.unshift({amount,method:data.get("method"),reference:data.get("reference"),date:new Date().toISOString(),verified:false});invoice.status=invoiceStatus(invoice);record("Payment recorded for "+invoice.number+" (unverified)");save();closeModal();render();notify("Payment recorded as unverified.")})}
-    function editBranding(){const org=organizations.find(item=>item.id===document.getElementById("brandingOrg").value)||organizations[0];if(!org)return;openModal(`<h2>Edit application branding</h2><form id="brandingForm"><label>Application title *</label><input class="form-control" name="appTitle" value="${esc(org.branding&&org.branding.appTitle||org.name+" Application")}" required><label style="margin-top:14px">Organization logo URL</label><input class="form-control" name="logo" type="url" value="${esc(org.branding&&org.branding.logo||"")}"><div class="summary">QIntellect footer branding is mandatory and cannot be changed here.</div><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Save branding</button></div></form>`);document.getElementById("brandingForm").addEventListener("submit",event=>{event.preventDefault();const data=new FormData(event.target);org.branding={appTitle:String(data.get("appTitle")).trim(),logo:String(data.get("logo")||"").trim()};org.updatedAt=new Date().toISOString();record("Branding updated for "+org.name);save();closeModal();render();notify("Application branding saved.")})}
+    function openInvoiceEdit(id){
+      const invoice=invoices.find(item=>item.id===id);if(!invoice)return;
+      openModal(`<h2>Edit ${esc(invoice.number)}</h2><form id="invoiceEditForm"><label>Due date *</label><input class="form-control" name="dueDate" type="date" value="${esc(invoice.dueDate)}" required><label style="margin-top:14px">Invoice status</label><select class="form-control" name="status"><option ${invoice.status==="Draft"?"selected":""}>Draft</option><option ${invoice.status==="Cancelled"?"selected":""}>Cancelled</option><option ${invoice.status==="Unpaid"?"selected":""}>Unpaid</option></select><label style="margin-top:14px">Notes</label><textarea class="form-control" name="notes" rows="3">${esc(invoice.notes||"")}</textarea><div class="summary">Paid and outstanding totals are calculated from the payment history and cannot be manually overwritten.</div><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Save invoice details</button></div></form>`);
+      document.getElementById("invoiceEditForm").addEventListener("submit",async event=>{
+        event.preventDefault();const data=new FormData(event.target);
+        try{
+          await fetch(`/api/invoices/${encodeURIComponent(invoice.id)}`,{
+            method:"PUT",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({dueDate:data.get("dueDate"),notes:String(data.get("notes")||""),status:String(data.get("status"))})
+          });
+          await reloadData();
+          closeModal();
+          render();
+          notify("Invoice details updated.");
+        }catch(err){
+          notify("Failed to update invoice: "+err.message,true);
+        }
+      });
+    }
+    function openPaymentForm(id){
+      const invoice=invoices.find(item=>item.id===id);if(!invoice)return;
+      openModal(`<h2>Record payment for ${esc(invoice.number)}</h2><div class="summary">Outstanding balance: <strong>${money(invoiceBalance(invoice))}</strong><br>Payments are manually recorded and remain <strong>unverified</strong>.</div><form id="paymentForm"><label>Amount *</label><input class="form-control" name="amount" type="number" min=".01" max="${invoiceBalance(invoice)}" step=".01" required><label style="margin-top:14px">Payment method</label><select class="form-control" name="method"><option>Bank transfer</option><option>Cash</option><option>Card</option><option>Other</option></select><label style="margin-top:14px">Transaction reference</label><input class="form-control" name="reference" maxlength="80"><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Save unverified payment</button></div></form>`);
+      document.getElementById("paymentForm").addEventListener("submit",async event=>{
+        event.preventDefault();const data=new FormData(event.target),amount=Number(data.get("amount"));
+        if(!amount||amount>invoiceBalance(invoice)){notify("Enter an amount within the outstanding balance.",true);return}
+        try{
+          await fetch(`/api/invoices/${encodeURIComponent(invoice.id)}/payments`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({amount,method:data.get("method"),reference:data.get("reference")})
+          });
+          record("Payment recorded for "+invoice.number+" (unverified)",invoice.organizationId,invoice.branchId);
+          await reloadData();
+          closeModal();
+          render();
+          notify("Payment recorded as unverified.");
+        }catch(err){
+          notify("Failed to record payment: "+err.message,true);
+        }
+      });
+    }
+    function editBranding(){
+      const org=organizations.find(item=>item.id===document.getElementById("brandingOrg").value)||organizations[0];if(!org)return;
+      openModal(`<h2>Edit application branding</h2><form id="brandingForm"><label>Application title *</label><input class="form-control" name="appTitle" value="${esc(org.branding&&org.branding.appTitle||org.name+" Application")}" required><label style="margin-top:14px">Organization logo URL</label><input class="form-control" name="logo" type="url" value="${esc(org.branding&&org.branding.logo||"")}"><div class="summary">QIntellect footer branding is mandatory and cannot be changed here.</div><div class="form-actions"><button type="button" class="btn-outline" data-action="close">Cancel</button><button class="btn-primary" type="submit">Save branding</button></div></form>`);
+      document.getElementById("brandingForm").addEventListener("submit",async event=>{
+        event.preventDefault();const data=new FormData(event.target);
+        const appTitle=String(data.get("appTitle")).trim(),logo=String(data.get("logo")||"").trim();
+        try{
+          await fetch(`/api/organizations/${encodeURIComponent(org.id)}/branding`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({appTitle,logo})
+          });
+          record("Branding updated for "+org.name,org.id);
+          await reloadData();
+          closeModal();
+          render();
+          notify("Application branding saved.");
+        }catch(err){
+          notify("Failed to save branding: "+err.message,true);
+        }
+      });
+    }
     document.addEventListener("click",event=>{
       const target=event.target.closest("[data-action],[data-page]");
       if(!target)return;
@@ -572,10 +1005,109 @@
       if(action==="record-payment"){openPaymentForm(id);return}
       if(action==="print-invoice"){const invoice=invoices.find(item=>item.id===id);if(invoice)printInvoice(invoice);return}
       if(action==="edit-branding"){editBranding();return}
+      if(action==="link-local-dashboard"){linkLocalDashboardToBranch(id,target.dataset.branchId);return}
     });
-    document.addEventListener("change",event=>{const target=event.target;if(!target)return;if(["buildFilter","buildBranchFilter","buildSort"].includes(target.id)){renderOrganizationBuildHistoryPage();return}const filterIds=["organizationFilter","organizationSort","moduleCategory","invoiceFilter"];if(filterIds.indexOf(target.id)>=0){render();return}if(!target.dataset||target.dataset.branchGrace===undefined)return;const orgSelect=document.getElementById("brandingOrg");if(!orgSelect)return;const org=organizations.find(item=>item.id===orgSelect.value),branch=org&&org.branches[Number(target.dataset.branchGrace)];if(branch){branch.graceDays=Number(target.value);save();render();notify("Grace period updated.")}})
-    document.addEventListener("input",event=>{const target=event.target;if(!target)return;if(target.id==="buildOrganizationSearch"){renderBuilds();return}if(target.id==="buildSearch"){renderOrganizationBuildHistoryPage();return}if(["organizationSearch","moduleSearch"].includes(target.id))render()})
-    document.getElementById("modal").addEventListener("click",event=>{if(event.target.id==="modal")closeModal()});restorePortal();
+
+    async function linkLocalDashboardToBranch(orgId,branchId){
+      const org=organizations.find(item=>item.id===orgId);if(!org)return;
+      const branch=org.branches.find(item=>item.id===branchId);if(!branch)return;
+      notify(`Linking Local Dashboard to ${branch.name}...`);
+      try{
+        const res=await fetch("/api/integration/local/sync",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({
+            organization_id:org.id,
+            organization_name:org.name,
+            branch_id:branch.id,
+            branch_name:branch.name,
+            branch_status:effectiveBranchAccess(org,branch),
+            license_id:org.tokenId||"LIC-QE-001",
+            license_status:org.status==="Active"?"active":"suspended",
+            license_start:org.tokenStartedAt,
+            license_expiry:org.tokenExpiresAt,
+            licensed_modules:org.modules
+          })
+        });
+        const data=await res.json();
+        if(res.ok&&data.success){
+          notify(`Local Dashboard successfully linked to ${branch.name}!`);
+          await updateLocalIntegrationStatus();
+          renderOrganizationDetail();
+        }else{
+          notify(`Failed to link Local Dashboard: ${data.error||"Unknown error"}`,true);
+        }
+      }catch(err){
+        notify(`Connection error: ${err.message}`,true);
+      }
+    }
+    document.addEventListener("change",async event=>{
+      const target=event.target;if(!target)return;
+      if(["buildFilter","buildBranchFilter","buildSort"].includes(target.id)){renderOrganizationBuildHistoryPage();return}
+      const filterIds=["organizationFilter","organizationSort","moduleCategory","invoiceFilter"];
+      if(filterIds.indexOf(target.id)>=0){render();return}
+      if(!target.dataset||target.dataset.branchGrace===undefined)return;
+      const orgSelect=document.getElementById("brandingOrg");if(!orgSelect)return;
+      const org=organizations.find(item=>item.id===orgSelect.value),branch=org&&org.branches[Number(target.dataset.branchGrace)];
+      if(branch){
+        const days=Number(target.value);
+        try{
+          await fetch(`/api/organizations/${encodeURIComponent(org.id)}/branches/${encodeURIComponent(branch.id)}/grace`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({graceDays:days})
+          });
+          branch.graceDays=days;
+          render();
+          notify("Grace period updated.");
+        }catch(err){
+          notify("Failed to update grace period: "+err.message,true);
+        }
+      }
+    });
+    document.addEventListener("input",event=>{const target=event.target;if(!target)return;if(target.id==="buildOrganizationSearch"){renderBuilds();return}if(target.id==="buildSearch"){renderOrganizationBuildHistoryPage();return}if(["organizationSearch","moduleSearch"].includes(target.id))render()});
+    document.getElementById("modal").addEventListener("click",event=>{if(event.target.id==="modal")closeModal()});
+    let _lastLocalIntegrationStatus = null;
+    async function updateLocalIntegrationStatus(){
+      try{
+        const res=await fetch("/api/integration/local/status");
+        const data=await res.json();
+        _lastLocalIntegrationStatus = data;
+        const dot=document.getElementById("localDashboardDot");
+        const txt=document.getElementById("localDashboardText");
+        if(dot&&txt){
+          if(data.connected){
+            dot.style.background="#238b86"; // success teal
+            let msg="Local Dashboard: Connected";
+            if(data.linked&&data.branch_name){
+              msg+=` (${data.branch_name} • ${data.licensed_modules?.length||0}/8 modules)`;
+            }else if(!data.linked){
+              msg+=" (Not Linked)";
+            }
+            txt.textContent=msg;
+          }else{
+            dot.style.background="#c55252"; // danger red
+            txt.textContent="Local Dashboard: Disconnected";
+          }
+        }
+        if(selectedOrganizationId){
+          renderOrganizationDetail();
+        }
+      }catch(err){
+        _lastLocalIntegrationStatus = { connected: false };
+        const dot=document.getElementById("localDashboardDot");
+        const txt=document.getElementById("localDashboardText");
+        if(dot)dot.style.background="#c55252";
+        if(txt)txt.textContent="Local Dashboard: Disconnected";
+      }
+    }
+
+    checkAuth().then(() => {
+      return checkLocalStorageMigration();
+    }).then(reloadData).then(restorePortal).then(()=>{
+      updateLocalIntegrationStatus();
+      setInterval(updateLocalIntegrationStatus,10000);
+    });
   </script>
 </body>
 </html>
