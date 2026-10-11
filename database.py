@@ -1,12 +1,14 @@
 import sqlite3
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.db")
+DB_PATH = os.environ.get("QINTELLECT_MAIN_DB_PATH") or os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.db")
 
 def get_connection() -> sqlite3.Connection:
     """Return a SQLite connection with foreign keys enabled and row factory configured."""
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -246,6 +248,23 @@ def init_db() -> bool:
             )
         ''')
 
+        # 14. Control Plane Users table (Step 6 control plane authentication)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS control_plane_users (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'organization_admin' CHECK(role IN ('platform_admin', 'organization_admin')),
+                organization_id TEXT,
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+                last_login_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+            )
+        ''')
+
         # 15. Branch Cameras (Cloud-configured cameras per branch)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS branch_cameras (
@@ -351,8 +370,8 @@ def init_db() -> bool:
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (org_id, branch_id, "Branch Head", "+92 302 9633999", "Branch Manager", "branch@demo-org.com"))
 
-            # Subscribe default demo organization to initial modules
-            for mod_id in ["attendance", "employees", "leave", "reports"]:
+            # Subscribe default demo organization to initial commercial modules
+            for mod_id in ["attendance", "shifts", "overtime", "leave", "payroll"]:
                 cursor.execute('''
                     INSERT OR IGNORE INTO organization_modules (organization_id, module_id, enabled)
                     VALUES (?, ?, 1)
