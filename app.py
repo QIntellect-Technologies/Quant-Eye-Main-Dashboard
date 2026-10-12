@@ -310,7 +310,7 @@ def attendance_report_page():
 @app.get("/client-portal")
 def client_portal_page():
     """Serve the existing Client Portal (Staff, Leaves, Overtime, Shifts, Payroll)."""
-    return render_template("local/index.html")
+    return render_template("local/index.html", is_cloud=True)
 
 
 @app.get("/api/dashboard/stats")
