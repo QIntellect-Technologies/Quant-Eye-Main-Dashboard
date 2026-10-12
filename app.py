@@ -9,13 +9,14 @@ from datetime import datetime
 from werkzeug.security import check_password_hash
 from jinja2 import ChoiceLoader, FileSystemLoader, PrefixLoader
 import database as db
+import logging
+logger = logging.getLogger("quanteye.main_dashboard")
 
 try:
     import cloud_database as cloud_db
 except Exception as _cdb_err:
     cloud_db = None
-    import logging
-    logging.getLogger("quanteye.app").warning("Cloud PostgreSQL module not loaded: %s", _cdb_err)
+    logger.warning("Cloud PostgreSQL module not loaded: %s", _cdb_err)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)
@@ -1015,7 +1016,48 @@ def get_cameras_for_branch(branch_id):
     except Exception as e:
         logger.warning("Could not query PostgreSQL cameras: %s", e)
 
-    # 2. Fallback to SQLite cache
+    # 2. Query Client Portal / Local Dashboard API (where client configured RTSP/NVR cameras)
+    try:
+        portal_url = LOCAL_DASHBOARD_URL.rstrip('/')
+        req = urllib.request.Request(f"{portal_url}/api/cameras?active_only=true", headers={"User-Agent": "QuantEye-Main-Dashboard"})
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            if resp.status == 200:
+                p_cams = json.loads(resp.read().decode('utf-8'))
+                matching = []
+                for c in p_cams:
+                    c_org = c.get("organization_id")
+                    c_br = c.get("branch_id")
+                    if (not c_org or c_org in (org_id, 'DEFAULT_ORG')) and (not c_br or c_br in (branch_id, 'DEFAULT_BRANCH')):
+                        matching.append({
+                            "camera_id": c.get("camera_id") or f"cam_{c.get('id')}",
+                            "id": c.get("camera_id") or f"cam_{c.get('id')}",
+                            "name": c.get("name") or c.get("camera_name", "Camera"),
+                            "camera_name": c.get("name") or c.get("camera_name", "Camera"),
+                            "camera_type": c.get("camera_type", "nvr"),
+                            "rtsp_url": c.get("rtsp_url", "0"),
+                            "room_name": c.get("room_name", "AI ROOM"),
+                            "location": c.get("room_name", "AI ROOM"),
+                            "channel_number": c.get("channel_number", 1),
+                            "active": c.get("active", 1)
+                        })
+                if matching:
+                    # Sync to PostgreSQL if connected
+                    try:
+                        import cloud_database as cloud_db
+                        cloud_db.set_cloud_cameras(org_id, branch_id, matching)
+                    except Exception as e_sync:
+                        logger.debug("Could not auto-sync portal cams to PG: %s", e_sync)
+                    return jsonify({
+                        "success": True,
+                        "organization_id": org_id,
+                        "branch_id": branch_id,
+                        "cameras": matching,
+                        "count": len(matching)
+                    }), 200
+    except Exception as pe:
+        logger.warning("Could not query client portal cameras: %s", pe)
+
+    # 3. Fallback to SQLite cache
     try:
         cams = db.get_branch_cameras(org_id, branch_id)
         if cams:
