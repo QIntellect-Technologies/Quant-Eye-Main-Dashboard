@@ -9,7 +9,13 @@ from datetime import datetime
 from werkzeug.security import check_password_hash
 from jinja2 import ChoiceLoader, FileSystemLoader, PrefixLoader
 import database as db
-import cloud_database as cloud_db
+
+try:
+    import cloud_database as cloud_db
+except Exception as _cdb_err:
+    cloud_db = None
+    import logging
+    logging.getLogger("quanteye.app").warning("Cloud PostgreSQL module not loaded: %s", _cdb_err)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)

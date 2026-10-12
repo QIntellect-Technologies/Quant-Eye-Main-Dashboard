@@ -38,16 +38,24 @@ APP_RUNTIME_ROLE = "app_runtime_role"
 _pool: Optional[pool.ThreadedConnectionPool] = None
 
 def get_connection_params(user: Optional[str] = None, password: Optional[str] = None) -> Dict[str, Any]:
-    return {
+    # Check if DATABASE_URL or POSTGRES_URL is provided (standard on Railway, Render, etc.)
+    db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+    if db_url and not user and not password:
+        return {"dsn": db_url}
+
+    params = {
         "host": PG_HOST,
         "port": PG_PORT,
         "dbname": PG_DATABASE,
         "user": user or PG_USER,
         "password": password or PG_PASSWORD,
     }
+    return params
 
 def get_raw_connection(user: Optional[str] = None, password: Optional[str] = None):
     params = get_connection_params(user, password)
+    if "dsn" in params:
+        return psycopg2.connect(params["dsn"])
     return psycopg2.connect(**params)
 
 def init_cloud_pool(minconn: int = 1, maxconn: int = 20) -> pool.ThreadedConnectionPool:
@@ -55,8 +63,12 @@ def init_cloud_pool(minconn: int = 1, maxconn: int = 20) -> pool.ThreadedConnect
     if _pool is None:
         params = get_connection_params()
         try:
-            _pool = pool.ThreadedConnectionPool(minconn, maxconn, **params)
-            logger.info("Initialized PostgreSQL connection pool (%s:%s/%s)", PG_HOST, PG_PORT, PG_DATABASE)
+            if "dsn" in params:
+                _pool = pool.ThreadedConnectionPool(minconn, maxconn, dsn=params["dsn"])
+                logger.info("Initialized PostgreSQL connection pool using DSN/DATABASE_URL")
+            else:
+                _pool = pool.ThreadedConnectionPool(minconn, maxconn, **params)
+                logger.info("Initialized PostgreSQL connection pool (%s:%s/%s)", PG_HOST, PG_PORT, PG_DATABASE)
         except Exception as e:
             logger.warning("Could not initialize PostgreSQL connection pool: %s", e)
             raise
