@@ -911,9 +911,12 @@ def sync_to_local_dashboard():
 def get_employees_for_branch(branch_id):
     """Fetch cloud-registered employees for a specific branch for Client Node synchronization."""
     org_id = request.args.get("organization_id")
-    user = get_current_user()
-    if user and user.get("role") == "organization_admin":
-        org_id = user.get("organization_id")
+    try:
+        user = get_current_user()
+        if user and user.get("role") == "organization_admin":
+            org_id = user.get("organization_id")
+    except Exception:
+        pass
     if not org_id:
         org_id = "ORG-001"
 
@@ -945,7 +948,7 @@ def get_employees_for_branch(branch_id):
 
     # 2. Try SQLite database
     try:
-        with db.get_db_connection() as conn:
+        with db.get_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 SELECT id, name, COALESCE(department, 'General'), COALESCE(position, ''), 
@@ -987,15 +990,17 @@ def get_employees_for_branch(branch_id):
 def get_cameras_for_branch(branch_id):
     """Fetch cloud-configured camera streams for a client node or dashboard."""
     org_id = request.args.get("organization_id")
-    # If authenticated user, respect organization scoping
-    user = get_current_user()
-    if user and user.get("role") == "organization_admin":
-        org_id = user.get("organization_id")
+    try:
+        user = get_current_user()
+        if user and user.get("role") == "organization_admin":
+            org_id = user.get("organization_id")
+    except Exception:
+        pass
 
     if not org_id:
         org_id = "ORG-001"
 
-    # Query PostgreSQL cloud database
+    # 1. Query PostgreSQL cloud database
     try:
         import cloud_database as cloud_db
         pg_cams = cloud_db.get_cloud_cameras(org_id, branch_id)
@@ -1010,29 +1015,41 @@ def get_cameras_for_branch(branch_id):
     except Exception as e:
         logger.warning("Could not query PostgreSQL cameras: %s", e)
 
-    # Fallback to local SQLite cache
-    cams = db.get_branch_cameras(org_id, branch_id)
-    if not cams:
-        cams = [
-            {
-                "camera_id": "cam_webcam_0",
-                "id": "cam_webcam_0",
-                "name": "Live Entrance Camera",
-                "camera_name": "Live Entrance Camera",
-                "camera_type": "webcam",
-                "rtsp_url": "0",
-                "room_name": "Main Entrance",
-                "location": "Main Entrance",
-                "channel_number": 1,
-                "active": 1
-            }
-        ]
+    # 2. Fallback to SQLite cache
+    try:
+        cams = db.get_branch_cameras(org_id, branch_id)
+        if cams:
+            return jsonify({
+                "success": True,
+                "organization_id": org_id,
+                "branch_id": branch_id,
+                "cameras": cams,
+                "count": len(cams)
+            }), 200
+    except Exception as e:
+        logger.warning("Could not query SQLite branch cameras: %s", e)
+
+    # 3. Default fallback
+    default_cams = [
+        {
+            "camera_id": "cam_webcam_0",
+            "id": "cam_webcam_0",
+            "name": "Live Entrance Camera",
+            "camera_name": "Live Entrance Camera",
+            "camera_type": "webcam",
+            "rtsp_url": "0",
+            "room_name": "Main Entrance",
+            "location": "Main Entrance",
+            "channel_number": 1,
+            "active": 1
+        }
+    ]
     return jsonify({
         "success": True,
         "organization_id": org_id,
         "branch_id": branch_id,
-        "cameras": cams,
-        "count": len(cams)
+        "cameras": default_cams,
+        "count": len(default_cams)
     }), 200
 
 
