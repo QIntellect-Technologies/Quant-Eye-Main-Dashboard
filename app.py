@@ -1040,20 +1040,23 @@ def get_cameras_for_branch(branch_id):
                             "channel_number": c.get("channel_number", 1),
                             "active": c.get("active", 1)
                         })
-                if matching:
-                    # Sync to PostgreSQL if connected
-                    try:
-                        import cloud_database as cloud_db
-                        cloud_db.set_cloud_cameras(org_id, branch_id, matching)
-                    except Exception as e_sync:
-                        logger.debug("Could not auto-sync portal cams to PG: %s", e_sync)
-                    return jsonify({
-                        "success": True,
-                        "organization_id": org_id,
-                        "branch_id": branch_id,
-                        "cameras": matching,
-                        "count": len(matching)
-                    }), 200
+                # Portal is authoritative: sync current state to PostgreSQL and SQLite (even if 0 cameras after deletion)
+                try:
+                    import cloud_database as cloud_db
+                    cloud_db.set_cloud_cameras(org_id, branch_id, matching)
+                except Exception as e_sync:
+                    logger.debug("Could not auto-sync portal cams to PG: %s", e_sync)
+                try:
+                    db.set_branch_cameras(org_id, branch_id, matching)
+                except Exception:
+                    pass
+                return jsonify({
+                    "success": True,
+                    "organization_id": org_id,
+                    "branch_id": branch_id,
+                    "cameras": matching,
+                    "count": len(matching)
+                }), 200
     except Exception as pe:
         logger.warning("Could not query client portal cameras: %s", pe)
 
@@ -1071,27 +1074,13 @@ def get_cameras_for_branch(branch_id):
     except Exception as e:
         logger.warning("Could not query SQLite branch cameras: %s", e)
 
-    # 3. Default fallback
-    default_cams = [
-        {
-            "camera_id": "cam_webcam_0",
-            "id": "cam_webcam_0",
-            "name": "Live Entrance Camera",
-            "camera_name": "Live Entrance Camera",
-            "camera_type": "webcam",
-            "rtsp_url": "0",
-            "room_name": "Main Entrance",
-            "location": "Main Entrance",
-            "channel_number": 1,
-            "active": 1
-        }
-    ]
+    # 4. If no cameras configured, return empty list (never return fake webcam 0)
     return jsonify({
         "success": True,
         "organization_id": org_id,
         "branch_id": branch_id,
-        "cameras": default_cams,
-        "count": len(default_cams)
+        "cameras": [],
+        "count": 0
     }), 200
 
 
