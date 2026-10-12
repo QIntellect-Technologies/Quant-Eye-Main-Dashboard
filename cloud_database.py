@@ -578,3 +578,206 @@ def get_attendance_events(org_id: str, branch_id: Optional[str] = None, user_con
         else:
             cur.execute("SELECT * FROM attendance_events WHERE organization_id = %s ORDER BY timestamp DESC;", (org_id,))
         return [dict(r) for r in cur.fetchall()]
+
+
+# =====================================================================
+# PHASE 2.3: EDGE NODE AUTHENTICATION & BATCH INGESTION
+# =====================================================================
+
+EDGE_JWT_SECRET = os.environ.get("EDGE_JWT_SECRET", "quanteye_cloud_edge_secret_key_v2_secure_38210")
+EDGE_TOKEN_EXPIRY_SECONDS = 3600  # 1 hour
+
+def register_edge_node(
+    org_id: str,
+    branch_id: str,
+    node_name: str,
+    secret: str,
+    node_id: Optional[str] = None,
+    hardware_uuid: Optional[str] = None,
+    status: str = "online"
+) -> Dict[str, Any]:
+    """Register or update an edge node with hashed cryptographic secret."""
+    n_id = node_id or f"edge_{uuid.uuid4().hex[:10]}"
+    sec_hash = generate_password_hash(secret)
+    with tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute("""
+            INSERT INTO edge_nodes (id, organization_id, branch_id, node_name, hardware_uuid, status, api_key_hash)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (organization_id, id) DO UPDATE SET
+                node_name = EXCLUDED.node_name,
+                hardware_uuid = COALESCE(EXCLUDED.hardware_uuid, edge_nodes.hardware_uuid),
+                status = EXCLUDED.status,
+                api_key_hash = EXCLUDED.api_key_hash,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id, organization_id, branch_id, node_name, status, created_at;
+        """, (n_id, org_id, branch_id, node_name, hardware_uuid, status, sec_hash))
+        row = cur.fetchone()
+        return dict(row)
+
+def authenticate_edge_node(edge_node_id: str, secret: str) -> Optional[Dict[str, Any]]:
+    """
+    Authenticate edge node using ID and secret.
+    Returns token payload dict if valid and active, else None.
+    """
+    import jwt
+    with tenant_context(is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute("""
+            SELECT id, organization_id, branch_id, node_name, status, api_key_hash
+            FROM edge_nodes
+            WHERE id = %s;
+        """, (edge_node_id,))
+        node = cur.fetchone()
+
+        if not node:
+            return None
+
+        if node["status"] != "online":
+            logger.warning("Edge node '%s' authentication rejected: status is '%s'", edge_node_id, node["status"])
+            return None
+
+        if not check_password_hash(node["api_key_hash"], secret):
+            logger.warning("Edge node '%s' authentication rejected: invalid secret", edge_node_id)
+            return None
+
+        # Update last heartbeat
+        cur.execute("UPDATE edge_nodes SET last_heartbeat = CURRENT_TIMESTAMP WHERE id = %s;", (edge_node_id,))
+
+        # Generate short-lived Edge JWT
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": node["id"],
+            "org_id": node["organization_id"],
+            "branch_id": node["branch_id"],
+            "node_name": node["node_name"],
+            "iat": int(now.timestamp()),
+            "exp": int(now.timestamp()) + EDGE_TOKEN_EXPIRY_SECONDS
+        }
+        token = jwt.encode(payload, EDGE_JWT_SECRET, algorithm="HS256")
+        return {
+            "token": token,
+            "expires_in": EDGE_TOKEN_EXPIRY_SECONDS,
+            "organization_id": node["organization_id"],
+            "branch_id": node["branch_id"],
+            "edge_node_id": node["id"]
+        }
+
+def verify_edge_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verify an Edge JWT and check that the underlying node remains active."""
+    import jwt
+    try:
+        decoded = jwt.decode(token, EDGE_JWT_SECRET, algorithms=["HS256"])
+        node_id = decoded.get("sub")
+        org_id = decoded.get("org_id")
+        branch_id = decoded.get("branch_id")
+
+        # Verify against database that node hasn't been revoked/deactivated since token issuance
+        with tenant_context(org_id=org_id, is_platform_admin=True, enforce_rls=False) as cur:
+            cur.execute("SELECT status FROM edge_nodes WHERE id = %s AND organization_id = %s;", (node_id, org_id))
+            row = cur.fetchone()
+            if not row or row["status"] != "online":
+                return None
+
+        return {
+            "edge_node_id": node_id,
+            "organization_id": org_id,
+            "branch_id": branch_id,
+            "node_name": decoded.get("node_name")
+        }
+    except Exception as e:
+        logger.warning("Edge token verification failed: %s", e)
+        return None
+
+def ingest_edge_sync_batch(
+    edge_node_auth: Dict[str, Any],
+    batch_sequence: int,
+    events: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Idempotently ingest an attendance sync batch.
+    Enforces verified tenant scope (NEVER trusts client payload).
+    """
+    org_id = edge_node_auth["organization_id"]
+    branch_id = edge_node_auth["branch_id"]
+    edge_node_id = edge_node_auth["edge_node_id"]
+
+    batch_id = f"BATCH-{org_id}-{branch_id}-{edge_node_id}-{batch_sequence}"
+    processed_count = 0
+    duplicate_count = 0
+
+    with tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
+        # 1. Record/Update batch in edge_sync_batches
+        cur.execute("""
+            INSERT INTO edge_sync_batches (id, organization_id, branch_id, edge_node_id, batch_sequence, record_count, status, received_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'received', CURRENT_TIMESTAMP)
+            ON CONFLICT (organization_id, id) DO UPDATE SET
+                record_count = EXCLUDED.record_count,
+                status = 'received',
+                received_at = CURRENT_TIMESTAMP;
+        """, (batch_id, org_id, branch_id, edge_node_id, batch_sequence, len(events)))
+
+        # 2. Ingest each event idempotently
+        for ev in events:
+            ev_id = ev.get("event_id") or f"ATT-{uuid.uuid4().hex}"
+            payload = ev.get("payload") or {}
+
+            # Fallback to payload fields if top-level event fields are inside payload
+            u_name = payload.get("detected_name") or ev.get("detected_name") or "Employee"
+            u_id = payload.get("user_id") or ev.get("user_id") or 1
+            conf = float(payload.get("confidence") or ev.get("confidence") or 1.0)
+            ev_type = ev.get("event_type") or payload.get("event_type") or "CHECK_IN"
+            if ev_type not in ('CHECK_IN', 'CHECK_OUT', 'BREAK_IN', 'BREAK_OUT', 'RECOGNITION'):
+                ev_type = "CHECK_IN"
+
+            raw_ts = payload.get("timestamp") or ev.get("timestamp")
+            if raw_ts:
+                try:
+                    ev_ts = datetime.fromisoformat(str(raw_ts))
+                except Exception:
+                    try:
+                        ev_ts = datetime.strptime(str(raw_ts), "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        ev_ts = datetime.now(timezone.utc)
+            else:
+                ev_ts = datetime.now(timezone.utc)
+
+            emp_pk = f"EMP-{org_id}-{branch_id}-{u_id}"
+            # Ensure employee placeholder exists so foreign key is satisfied
+            cur.execute("""
+                INSERT INTO employees (id, organization_id, branch_id, employee_code, name)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (organization_id, id) DO NOTHING;
+            """, (emp_pk, org_id, branch_id, f"EMP-{u_id}", u_name))
+
+            # Idempotently insert into attendance_events
+            # Unique identification: (organization_id, id)
+            cur.execute("""
+                INSERT INTO attendance_events (
+                    id, organization_id, branch_id, employee_id,
+                    event_type, confidence, sync_status, timestamp
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'synced', %s)
+                ON CONFLICT (organization_id, id) DO NOTHING;
+            """, (ev_id, org_id, branch_id, emp_pk, ev_type, conf, ev_ts))
+
+            if cur.rowcount > 0:
+                processed_count += 1
+            else:
+                duplicate_count += 1
+
+        # Mark batch processed
+        cur.execute("""
+            UPDATE edge_sync_batches
+            SET status = 'processed', processed_at = CURRENT_TIMESTAMP
+            WHERE organization_id = %s AND id = %s;
+        """, (org_id, batch_id))
+
+    return {
+        "success": True,
+        "batch_id": batch_id,
+        "batch_sequence": batch_sequence,
+        "organization_id": org_id,
+        "branch_id": branch_id,
+        "records_received": len(events),
+        "records_ingested": processed_count,
+        "duplicates_skipped": duplicate_count
+    }

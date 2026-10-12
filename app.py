@@ -154,6 +154,65 @@ def auth_me():
 
 
 # ==============================================================================
+# PHASE 2.3: CLOUD EDGE AUTHENTICATION & BATCH INGESTION ENDPOINTS
+# ==============================================================================
+
+@app.post("/api/cloud/edge/auth")
+def cloud_edge_auth():
+    """Authenticate Edge Node and return short-lived Edge JWT."""
+    payload = request.get_json(silent=True) or {}
+    node_id = str(payload.get("edge_node_id", "")).strip()
+    secret = str(payload.get("secret", "")).strip()
+
+    if not node_id or not secret:
+        return jsonify({"success": False, "error": "Missing edge_node_id or secret"}), 400
+
+    try:
+        import cloud_database as cloud_db
+        auth_res = cloud_db.authenticate_edge_node(node_id, secret)
+        if not auth_res:
+            return jsonify({"success": False, "error": "Invalid edge credentials or edge node inactive/revoked"}), 401
+        return jsonify({"success": True, **auth_res}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Authentication server error: {e}"}), 500
+
+@app.post("/api/cloud/sync/batch")
+def cloud_sync_batch():
+    """
+    Ingest attendance event batches from authenticated Edge Node.
+    NEVER trusts organization_id or branch_id from client payload.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"success": False, "error": "Missing or malformed Authorization header"}), 401
+
+    token = auth_header.split(" ", 1)[1].strip()
+
+    try:
+        import cloud_database as cloud_db
+        node_auth = cloud_db.verify_edge_token(token)
+        if not node_auth:
+            return jsonify({"success": False, "error": "Unauthorized: invalid, expired, or revoked edge token"}), 401
+
+        payload = request.get_json(silent=True) or {}
+        batch_seq = int(payload.get("batch_sequence", 1))
+        events = payload.get("events", [])
+
+        if not isinstance(events, list):
+            return jsonify({"success": False, "error": "Invalid payload: events must be a list"}), 400
+
+        result = cloud_db.ingest_edge_sync_batch(
+            edge_node_auth=node_auth,
+            batch_sequence=batch_seq,
+            events=events
+        )
+
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Batch ingestion failed: {e}"}), 500
+
+
+# ==============================================================================
 # PAGE ROUTE
 # ==============================================================================
 
