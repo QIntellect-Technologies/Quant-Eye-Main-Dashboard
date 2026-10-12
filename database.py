@@ -2,8 +2,19 @@ import sqlite3
 import os
 import uuid
 import json
+import logging
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
+
+logger = logging.getLogger("quanteye.main_db")
+
+try:
+    import cloud_database as cloud_db
+    _HAS_CLOUD_DB = True
+except Exception as _ce:
+    cloud_db = None
+    _HAS_CLOUD_DB = False
+    logger.warning("Cloud PostgreSQL persistence layer not initialized: %s", _ce)
 
 def _resolve_db_path() -> str:
     if os.environ.get("QINTELLECT_MAIN_DB_PATH"):
@@ -417,6 +428,13 @@ def init_db() -> bool:
         _seed_org("ORG-257281", "Optimum Tech", "Technology", "optimumtech@gmail.com", "0300-3823923", "Silicon Plaza, Fl 2", 38, ["attendance", "shifts", "payroll"], "QE-9A5DDEE7B01A41C18B2F", "optimumtech@gmail.com", "Pass1234!")
 
         conn.commit()
+
+    if _HAS_CLOUD_DB:
+        try:
+            cloud_db.init_cloud_db()
+        except Exception as e:
+            logger.warning("cloud_db init failed during init_db: %s", e)
+
     return True
 
 
@@ -582,6 +600,34 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
         ''', (org_id, f"Created organization '{name}' (ID: {org_id})"))
 
         conn.commit()
+
+    if _HAS_CLOUD_DB:
+        try:
+            cloud_db.create_organization(
+                org_id=org_id,
+                name=name,
+                industry=industry,
+                email=email,
+                phone=phone,
+                address=address,
+                status=status
+            )
+            b_list = branches_data if branches_data else [{'id': 'BR-01', 'name': 'Main Branch', 'city': '', 'address': address}]
+            for b in b_list:
+                cloud_db.create_branch(
+                    org_id=org_id,
+                    branch_id=b.get('id', 'BR-01'),
+                    name=b.get('name', 'Main Branch'),
+                    city=b.get('city', ''),
+                    address=b.get('address', address),
+                    token_key=b.get('tokenKey') or f"KEY-{org_id}-{b.get('id', 'BR-01')}"
+                )
+            for mid in selected_modules:
+                cloud_db.set_organization_module(org_id, mid, is_enabled=True)
+            cloud_db.create_organization_license(org_id, token_key)
+            cloud_db.set_organization_branding(org_id, company_name=f"QuantEye - {name}")
+        except Exception as e:
+            logger.warning("cloud_db dual write error in create_organization: %s", e)
 
     return get_organization_by_id(org_id) or {}
 
@@ -1242,10 +1288,9 @@ def ensure_default_users() -> None:
     from werkzeug.security import generate_password_hash
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM control_plane_users")
-        count = cursor.fetchone()[0]
-        if count == 0:
-            # Platform Admin
+        # Platform Admin
+        cursor.execute("SELECT id FROM control_plane_users WHERE LOWER(email) = 'admin@qintellect.com'")
+        if not cursor.fetchone():
             cursor.execute('''
                 INSERT INTO control_plane_users (id, name, email, password_hash, role, organization_id, active)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1258,7 +1303,9 @@ def ensure_default_users() -> None:
                 None,
                 1
             ))
-            # Organization Admin for Fork n Knives / Demo Org (ORG-001)
+        # Organization Admin for Fork n Knives / Demo Org (ORG-001)
+        cursor.execute("SELECT id FROM control_plane_users WHERE LOWER(email) = 'admin@forknknives.com'")
+        if not cursor.fetchone():
             cursor.execute('''
                 INSERT INTO control_plane_users (id, name, email, password_hash, role, organization_id, active)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1271,6 +1318,47 @@ def ensure_default_users() -> None:
                 "ORG-001",
                 1
             ))
+
+    if _HAS_CLOUD_DB:
+        try:
+            cloud_db.create_organization(
+                org_id="PLATFORM",
+                name="QIntellect Cloud Platform",
+                industry="Software",
+                email="admin@qintellect.com",
+                status="Active"
+            )
+            cloud_db.create_cloud_user(
+                organization_id="PLATFORM",
+                username="admin_qintellect",
+                email="admin@qintellect.com",
+                password="admin123",
+                role="platform_admin",
+                user_id="USR-PLATFORM-ADMIN"
+            )
+            # Ensure ORG-001 exists in PostgreSQL
+            cloud_db.create_organization(
+                org_id="ORG-001",
+                name="Demo Organization",
+                industry="Technology",
+                email="contact@demo-org.com",
+                status="Active"
+            )
+            cloud_db.create_branch(
+                org_id="ORG-001",
+                branch_id="BR-ORG-001",
+                name="Main Branch"
+            )
+            cloud_db.create_cloud_user(
+                organization_id="ORG-001",
+                username="fork_admin",
+                email="admin@forknknives.com",
+                password="fork123",
+                role="org_admin",
+                user_id="USR-ORG-ADMIN-001"
+            )
+        except Exception as e:
+            logger.warning("cloud_db error during ensure_default_users: %s", e)
 
 def get_branch_cameras(organization_id: str, branch_id: str) -> List[Dict[str, Any]]:
     """Retrieve all configured cameras for a branch."""
