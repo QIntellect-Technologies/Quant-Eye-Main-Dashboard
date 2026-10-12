@@ -907,6 +907,82 @@ def sync_to_local_dashboard():
 # CLOUD CAMERA CONFIGURATION & REAL-TIME EVENT INGESTION
 # ==============================================================================
 
+@app.get("/api/branches/<branch_id>/employees")
+def get_employees_for_branch(branch_id):
+    """Fetch cloud-registered employees for a specific branch for Client Node synchronization."""
+    org_id = request.args.get("organization_id")
+    user = get_current_user()
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    if not org_id:
+        org_id = "ORG-001"
+
+    # 1. Try PostgreSQL
+    try:
+        import cloud_database as cloud_db
+        pg_emps = cloud_db.get_employees(org_id=org_id, branch_id=branch_id)
+        if pg_emps:
+            result = []
+            for e in pg_emps:
+                result.append({
+                    "id": str(e.get("id")),
+                    "name": e.get("name") or e.get("full_name", "Employee"),
+                    "employee_code": e.get("employee_code") or f"EMP-{e.get('id')}",
+                    "department": e.get("department") or "General",
+                    "position": e.get("designation") or e.get("position") or "",
+                    "organization_id": org_id,
+                    "branch_id": branch_id
+                })
+            return jsonify({
+                "success": True,
+                "organization_id": org_id,
+                "branch_id": branch_id,
+                "employees": result,
+                "count": len(result)
+            }), 200
+    except Exception as pe:
+        logger.warning("Could not query PostgreSQL employees: %s", pe)
+
+    # 2. Try SQLite database
+    try:
+        with db.get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, name, COALESCE(department, 'General'), COALESCE(position, ''), 
+                       COALESCE(notes, ''), COALESCE(employee_code, '')
+                FROM users 
+                WHERE (organization_id = ? AND branch_id = ?) 
+                   OR (organization_id IS NULL OR organization_id = ?)
+            """, (org_id, branch_id, org_id))
+            rows = cur.fetchall()
+            result = [{
+                "id": str(r[0]),
+                "name": r[1],
+                "department": r[2],
+                "position": r[3],
+                "employee_code": r[5] or r[4] or f"EMP-{r[0]}",
+                "organization_id": org_id,
+                "branch_id": branch_id
+            } for r in rows]
+            return jsonify({
+                "success": True,
+                "organization_id": org_id,
+                "branch_id": branch_id,
+                "employees": result,
+                "count": len(result)
+            }), 200
+    except Exception as se:
+        logger.warning("Could not query SQLite employees: %s", se)
+
+    return jsonify({
+        "success": True,
+        "organization_id": org_id,
+        "branch_id": branch_id,
+        "employees": [],
+        "count": 0
+    }), 200
+
+
 @app.get("/api/branches/<branch_id>/cameras")
 def get_cameras_for_branch(branch_id):
     """Fetch cloud-configured camera streams for a client node or dashboard."""
