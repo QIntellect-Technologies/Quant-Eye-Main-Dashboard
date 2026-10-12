@@ -740,24 +740,40 @@ def ingest_edge_sync_batch(
             else:
                 ev_ts = datetime.now(timezone.utc)
 
-            emp_pk = f"EMP-{org_id}-{branch_id}-{u_id}"
-            # Ensure employee placeholder exists so foreign key is satisfied
+            # Look up if employee already exists by ID or by employee_code
             cur.execute("""
-                INSERT INTO employees (id, organization_id, branch_id, employee_code, name)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (organization_id, id) DO NOTHING;
-            """, (emp_pk, org_id, branch_id, f"EMP-{u_id}", u_name))
+                SELECT id FROM employees 
+                WHERE organization_id = %s AND (id = %s OR (branch_id = %s AND employee_code = %s))
+                LIMIT 1;
+            """, (org_id, f"EMP-{org_id}-{branch_id}-{u_id}", branch_id, f"EMP-{u_id}"))
+            existing_emp = cur.fetchone()
+
+            if existing_emp:
+                emp_pk = existing_emp["id"]
+            else:
+                emp_pk = f"EMP-{org_id}-{branch_id}-{u_id}"
+                # Ensure employee placeholder exists so foreign key is satisfied
+                cur.execute("""
+                    INSERT INTO employees (id, organization_id, branch_id, employee_code, name)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (organization_id, branch_id, employee_code) DO NOTHING;
+                """, (emp_pk, org_id, branch_id, f"EMP-{u_id}", u_name))
+
+            loc = payload.get("location") or ev.get("location") or "Main Entrance"
+            dev = payload.get("device_id") or ev.get("device_id") or "Edge Camera"
+            src = payload.get("source") or ev.get("source") or "auto"
 
             # Idempotently insert into attendance_events
             # Unique identification: (organization_id, id)
             cur.execute("""
                 INSERT INTO attendance_events (
                     id, organization_id, branch_id, employee_id,
-                    event_type, confidence, sync_status, timestamp
+                    event_type, confidence, sync_status, timestamp,
+                    location, device_id, source
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'synced', %s)
+                VALUES (%s, %s, %s, %s, %s, %s, 'synced', %s, %s, %s, %s)
                 ON CONFLICT (organization_id, id) DO NOTHING;
-            """, (ev_id, org_id, branch_id, emp_pk, ev_type, conf, ev_ts))
+            """, (ev_id, org_id, branch_id, emp_pk, ev_type, conf, ev_ts, loc, dev, src))
 
             if cur.rowcount > 0:
                 processed_count += 1
@@ -781,3 +797,514 @@ def ingest_edge_sync_batch(
         "records_ingested": processed_count,
         "duplicates_skipped": duplicate_count
     }
+
+
+# =====================================================================
+# PHASE 2.4: CONNECT EXISTING PAGES TO REAL CLOUD POSTGRESQL DATA
+# Real Data Only — No Fake Data — Strict Tenant Isolation
+# =====================================================================
+
+def check_module_entitlement(org_id: str, module_key: str, user_context: Optional[CloudUser] = None) -> bool:
+    """Check if organization is licensed for the requested module."""
+    # Foundational modules are always permitted
+    if module_key in ("attendance", "staff", "settings", "employees"):
+        return True
+    
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=True, enforce_rls=False) as cur:
+        # Check organization_modules table
+        cur.execute("""
+            SELECT om.is_enabled 
+            FROM organization_modules om
+            JOIN module_catalog mc ON om.module_id = mc.id
+            WHERE om.organization_id = %s AND (mc.id = %s OR lower(mc.name) LIKE %s)
+            AND om.is_enabled = TRUE;
+        """, (org_id, module_key, f"%{module_key.lower()}%"))
+        row = cur.fetchone()
+        if row and row.get("is_enabled"):
+            return True
+
+        # Check organization_licenses active modules
+        cur.execute("""
+            SELECT tier FROM organization_licenses
+            WHERE organization_id = %s AND status = 'active' AND expires_at >= CURRENT_TIMESTAMP;
+        """, (org_id,))
+        lic = cur.fetchone()
+        if lic:
+            tier = (lic.get("tier") or "").lower()
+            if tier in ("enterprise", "all_inclusive", "pro"):
+                return True
+
+    return False
+
+
+def get_cloud_kpis(user_context: Optional[CloudUser] = None) -> Dict[str, Any]:
+    """Return real control plane KPIs derived directly from PostgreSQL."""
+    with tenant_context(user=user_context, is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute("SELECT count(*) as count FROM organizations;")
+        orgs_total = cur.fetchone()["count"]
+
+        cur.execute("SELECT count(*) as count FROM organizations WHERE status = 'Active';")
+        orgs_active = cur.fetchone()["count"]
+
+        cur.execute("SELECT count(*) as count FROM module_catalog WHERE is_active = TRUE;")
+        mods_total = cur.fetchone()["count"]
+
+        cur.execute("SELECT count(*) as count FROM edge_sync_batches;")
+        batches_total = cur.fetchone()["count"]
+
+        cur.execute("SELECT count(*) as count FROM employees;")
+        emps_total = cur.fetchone()["count"]
+
+        cur.execute("SELECT count(*) as count FROM attendance_events;")
+        events_total = cur.fetchone()["count"]
+
+        return {
+            "organizations_total": orgs_total,
+            "organizations_active": orgs_active,
+            "modules_total": mods_total,
+            "builds_total": batches_total,
+            "employees_total": emps_total,
+            "events_total": events_total
+        }
+
+
+def get_cloud_staff_list(
+    org_id: str,
+    branch_id: Optional[str] = None,
+    search: Optional[str] = None,
+    department: Optional[str] = None,
+    user_context: Optional[CloudUser] = None
+) -> List[Dict[str, Any]]:
+    """Fetch real employee roster from PostgreSQL with tenant & branch isolation."""
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        query = """
+            SELECT 
+                e.id,
+                e.id as user_id,
+                e.employee_code,
+                e.name,
+                e.email,
+                e.phone,
+                COALESCE(e.department, d.name, 'General') as department,
+                COALESCE(e.position, des.title, 'Staff Member') as position,
+                COALESCE(e.salary, 0.0) as salary,
+                COALESCE(e.cnic, '') as cnic,
+                CASE WHEN e.is_active THEN 1 ELSE 0 END as active,
+                COALESCE(e.checkin_cameras, 'all') as checkin_cameras,
+                COALESCE(e.checkout_cameras, 'all') as checkout_cameras,
+                e.shift_id,
+                e.created_at
+            FROM employees e
+            LEFT JOIN departments d ON e.organization_id = d.organization_id AND e.department_id = d.id
+            LEFT JOIN designations des ON e.organization_id = des.organization_id AND e.designation_id = des.id
+            WHERE e.organization_id = %s
+        """
+        params = [org_id]
+
+        if branch_id:
+            query += " AND e.branch_id = %s"
+            params.append(branch_id)
+
+        if department and department.lower() not in ("all", "all departments", ""):
+            query += " AND (lower(e.department) = lower(%s) OR lower(d.name) = lower(%s))"
+            params.extend([department, department])
+
+        if search and search.strip():
+            s_term = f"%{search.strip().lower()}%"
+            query += " AND (lower(e.name) LIKE %s OR lower(e.employee_code) LIKE %s OR lower(COALESCE(e.email, '')) LIKE %s OR lower(COALESCE(e.cnic, '')) LIKE %s)"
+            params.extend([s_term, s_term, s_term, s_term])
+
+        query += " ORDER BY e.name ASC;"
+        cur.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["salary"] = float(r["salary"] or 0)
+        return rows
+
+
+def get_detailed_cloud_attendance_report(
+    org_id: str,
+    branch_id: Optional[str] = None,
+    target_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    department: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    search_query: Optional[str] = None,
+    limit: int = 500,
+    user_context: Optional[CloudUser] = None
+) -> Dict[str, Any]:
+    """
+    Generate comprehensive attendance report from real PostgreSQL attendance_events.
+    Returns the exact structure and fields required by attendance_report.html and reports-view.
+    """
+    from datetime import date, timedelta
+
+    # 1. Resolve date boundaries
+    today = date.today().isoformat()
+    if target_date == "today" or (not target_date and not start_date):
+        start_date = today
+        end_date = today
+        is_multi_day = False
+    elif target_date == "yesterday":
+        yest = (date.today() - timedelta(days=1)).isoformat()
+        start_date = yest
+        end_date = yest
+        is_multi_day = False
+    elif target_date == "this_week":
+        # last 7 days
+        start_date = (date.today() - timedelta(days=6)).isoformat()
+        end_date = today
+        is_multi_day = True
+    elif target_date == "this_month":
+        start_date = date.today().replace(day=1).isoformat()
+        end_date = today
+        is_multi_day = (start_date != end_date)
+    elif target_date and not start_date:
+        start_date = target_date
+        end_date = target_date
+        is_multi_day = False
+    else:
+        start_date = start_date or today
+        end_date = end_date or start_date
+        is_multi_day = (start_date != end_date)
+
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        # 2. Fetch employee roster for this tenant/branch
+        emp_query = """
+            SELECT 
+                e.id, 
+                e.employee_code, 
+                e.name, 
+                COALESCE(e.department, d.name, 'General') as department,
+                COALESCE(e.position, des.title, 'Staff Member') as position,
+                COALESCE(e.salary, 0.0) as salary,
+                e.shift_id,
+                COALESCE(s.name, 'Default Shift') as shift_name
+            FROM employees e
+            LEFT JOIN departments d ON e.organization_id = d.organization_id AND e.department_id = d.id
+            LEFT JOIN designations des ON e.organization_id = des.organization_id AND e.designation_id = des.id
+            LEFT JOIN shifts s ON e.organization_id = s.organization_id AND e.shift_id = s.id
+            WHERE e.organization_id = %s
+        """
+        emp_params = [org_id]
+        if branch_id:
+            emp_query += " AND e.branch_id = %s"
+            emp_params.append(branch_id)
+
+        if department and department.lower() not in ("all", "all departments", ""):
+            emp_query += " AND (lower(e.department) = lower(%s) OR lower(d.name) = lower(%s))"
+            emp_params.extend([department, department])
+
+        if search_query and search_query.strip():
+            s_term = f"%{search_query.strip().lower()}%"
+            emp_query += " AND (lower(e.name) LIKE %s OR lower(e.employee_code) LIKE %s)"
+            emp_params.extend([s_term, s_term])
+
+        emp_query += " ORDER BY e.name ASC;"
+        cur.execute(emp_query, emp_params)
+        employees = [dict(r) for r in cur.fetchall()]
+        emp_ids = [e["id"] for e in employees]
+
+        # 3. Fetch attendance events in the period
+        events_by_emp = {}
+        if emp_ids:
+            cur.execute("""
+                SELECT 
+                    id, organization_id, branch_id, employee_id, camera_id,
+                    timestamp, event_type, confidence, source, location, device_id,
+                    marked_by, notes, shift_id
+                FROM attendance_events
+                WHERE organization_id = %s 
+                  AND timestamp >= %s::timestamptz 
+                  AND timestamp <= (%s::date + interval '1 day')::timestamptz
+                ORDER BY timestamp ASC;
+            """, (org_id, start_date, end_date))
+            for ev in cur.fetchall():
+                e_id = ev["employee_id"]
+                if e_id not in events_by_emp:
+                    events_by_emp[e_id] = []
+                events_by_emp[e_id].append(dict(ev))
+
+        # 4. Construct records
+        records = []
+        present_count = 0
+        late_count = 0
+        absent_count = 0
+        dept_stats = {}
+
+        for emp in employees:
+            e_id = emp["id"]
+            d_name = emp["department"]
+            if d_name not in dept_stats:
+                dept_stats[d_name] = {"department": d_name, "total_staff": 0, "present": 0, "absent": 0, "late": 0}
+            dept_stats[d_name]["total_staff"] += 1
+
+            emp_events = events_by_emp.get(e_id, [])
+
+            if emp_events:
+                # Employee is present
+                first_ev = emp_events[0]
+                last_ev = emp_events[-1] if len(emp_events) > 1 else None
+
+                first_seen_ts = first_ev["timestamp"].strftime("%I:%M %p") if isinstance(first_ev["timestamp"], datetime) else str(first_ev["timestamp"])
+                last_seen_ts = last_ev["timestamp"].strftime("%I:%M %p") if (last_ev and isinstance(last_ev["timestamp"], datetime)) else ("-" if not last_ev else str(last_ev["timestamp"]))
+                
+                # Check status
+                status = "PRESENT"
+                if first_ev.get("event_type") == "CHECK_IN" and (not last_ev or last_ev == first_ev):
+                    status = "CHECKED_IN"
+                elif last_ev and last_ev.get("event_type") == "CHECK_OUT":
+                    status = "CHECKED_OUT"
+
+                present_count += 1
+                dept_stats[d_name]["present"] += 1
+
+                records.append({
+                    "user_id": e_id,
+                    "id": e_id,
+                    "name": emp["name"],
+                    "department": d_name,
+                    "position": emp["position"],
+                    "shift_name": emp["shift_name"],
+                    "date": start_date,
+                    "status": status,
+                    "first_seen": first_seen_ts,
+                    "last_seen": last_seen_ts,
+                    "checkin_camera": first_ev.get("device_id") or first_ev.get("camera_id") or "Camera #1",
+                    "checkout_camera": (last_ev.get("device_id") or last_ev.get("camera_id") or "-") if last_ev else "-",
+                    "source": first_ev.get("source") or "auto",
+                    "source_label": "Auto by System" if (first_ev.get("source") != "manual") else "Manual by Admin",
+                    "marked_by": first_ev.get("marked_by") or "System",
+                    "notes": first_ev.get("notes") or "",
+                    "daily_records": []
+                })
+            else:
+                absent_count += 1
+                dept_stats[d_name]["absent"] += 1
+
+                records.append({
+                    "user_id": e_id,
+                    "id": e_id,
+                    "name": emp["name"],
+                    "department": d_name,
+                    "position": emp["position"],
+                    "shift_name": emp["shift_name"],
+                    "date": start_date,
+                    "status": "ABSENT",
+                    "first_seen": None,
+                    "last_seen": None,
+                    "checkin_camera": "-",
+                    "checkout_camera": "-",
+                    "source": "auto",
+                    "source_label": "-",
+                    "marked_by": "System",
+                    "notes": "",
+                    "daily_records": []
+                })
+
+        # Apply status filter if supplied
+        if status_filter and status_filter.lower() not in ("all", "all statuses", ""):
+            records = [r for r in records if r["status"].upper() == status_filter.upper()]
+
+        total_enrolled = len(employees)
+        att_rate = round((present_count / total_enrolled * 100), 1) if total_enrolled > 0 else 0.0
+
+        dept_summary = list(dept_stats.values())
+        for ds in dept_summary:
+            tot = ds["total_staff"]
+            ds["attendance_rate"] = round((ds["present"] / tot * 100), 1) if tot > 0 else 0.0
+
+        date_label = start_date if not is_multi_day else f"{start_date} to {end_date}"
+
+        return {
+            "is_multi_day": is_multi_day,
+            "date_label": date_label,
+            "start_date": start_date,
+            "end_date": end_date,
+            "total_days": 1,
+            "summary": {
+                "total_enrolled": total_enrolled,
+                "total_registered": total_enrolled,
+                "total_matching": len(records),
+                "attended_count": present_count,
+                "total_present_days": present_count,
+                "present": present_count,
+                "total_late_days": late_count,
+                "late": late_count,
+                "total_absent_days": absent_count,
+                "absent": absent_count,
+                "attendance_rate": att_rate
+            },
+            "records": records,
+            "rows": records,
+            "departments": dept_summary
+        }
+
+
+def get_cloud_leave_requests(
+    org_id: str,
+    branch_id: Optional[str] = None,
+    status: Optional[str] = None,
+    user_context: Optional[CloudUser] = None
+) -> List[Dict[str, Any]]:
+    """Fetch real leave requests from PostgreSQL."""
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        query = """
+            SELECT 
+                lr.id,
+                lr.employee_id,
+                lr.employee_id as user_id,
+                e.name as user_name,
+                lr.leave_type,
+                lr.start_date,
+                lr.end_date,
+                lr.reason,
+                lr.status,
+                lr.approved_by,
+                lr.created_at
+            FROM leave_requests lr
+            LEFT JOIN employees e ON lr.organization_id = e.organization_id AND lr.employee_id = e.id
+            WHERE lr.organization_id = %s
+        """
+        params = [org_id]
+        if branch_id:
+            query += " AND lr.branch_id = %s"
+            params.append(branch_id)
+        if status and status.lower() not in ("all", ""):
+            query += " AND lr.status = %s"
+            params.append(status)
+        query += " ORDER BY lr.created_at DESC;"
+        cur.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_cloud_overtime_records(
+    org_id: str,
+    branch_id: Optional[str] = None,
+    status: Optional[str] = None,
+    user_context: Optional[CloudUser] = None
+) -> List[Dict[str, Any]]:
+    """Fetch real overtime records from PostgreSQL."""
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        query = """
+            SELECT 
+                ot.id,
+                ot.employee_id,
+                ot.employee_id as user_id,
+                e.name as user_name,
+                ot.work_date as ot_date,
+                ot.hours,
+                ot.reason,
+                ot.status,
+                ot.approved_by,
+                ot.created_at
+            FROM overtime_records ot
+            LEFT JOIN employees e ON ot.organization_id = e.organization_id AND ot.employee_id = e.id
+            WHERE ot.organization_id = %s
+        """
+        params = [org_id]
+        if branch_id:
+            query += " AND ot.branch_id = %s"
+            params.append(branch_id)
+        if status and status.lower() not in ("all", ""):
+            query += " AND ot.status = %s"
+            params.append(status)
+        query += " ORDER BY ot.work_date DESC;"
+        cur.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["hours"] = float(r["hours"] or 0)
+        return rows
+
+
+def get_cloud_shifts(
+    org_id: str,
+    branch_id: Optional[str] = None,
+    user_context: Optional[CloudUser] = None
+) -> List[Dict[str, Any]]:
+    """Fetch real shift schedules from PostgreSQL."""
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        query = """
+            SELECT 
+                id, organization_id, branch_id, name,
+                start_time::text, end_time::text, grace_minutes as grace_period_minutes,
+                working_days, is_default, is_active as active, created_at
+            FROM shifts
+            WHERE organization_id = %s
+        """
+        params = [org_id]
+        if branch_id:
+            query += " AND branch_id = %s"
+            params.append(branch_id)
+        query += " ORDER BY id ASC;"
+        cur.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_cloud_payroll_runs(
+    org_id: str,
+    branch_id: Optional[str] = None,
+    user_context: Optional[CloudUser] = None
+) -> List[Dict[str, Any]]:
+    """Fetch real finalized/draft payroll runs from PostgreSQL."""
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        query = """
+            SELECT 
+                id, organization_id, branch_id, payroll_month,
+                period_start, period_end, employee_count,
+                total_basic_salary, total_deduction, total_amount as total_net_salary,
+                status, created_at
+            FROM payroll_runs
+            WHERE organization_id = %s
+        """
+        params = [org_id]
+        if branch_id:
+            query += " AND branch_id = %s"
+            params.append(branch_id)
+        query += " ORDER BY period_start DESC;"
+        cur.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["total_basic_salary"] = float(r["total_basic_salary"] or 0)
+            r["total_deduction"] = float(r["total_deduction"] or 0)
+            r["total_net_salary"] = float(r["total_net_salary"] or 0)
+        return rows
+
+
+def get_cloud_payroll_records(
+    org_id: str,
+    run_id: str,
+    branch_id: Optional[str] = None,
+    user_context: Optional[CloudUser] = None
+) -> List[Dict[str, Any]]:
+    """Fetch real immutable employee payroll lines for a payroll run."""
+    with tenant_context(user=user_context, org_id=org_id, branch_id=branch_id) as cur:
+        query = """
+            SELECT 
+                pr.id, pr.payroll_run_id, pr.employee_id,
+                e.name as employee_name,
+                COALESCE(e.department, 'General') as department,
+                COALESCE(e.position, 'Staff Member') as designation,
+                pr.basic_salary, pr.allowances, pr.deductions, pr.net_salary,
+                pr.scheduled_workdays, pr.present_days, pr.absent_days, pr.late_days,
+                pr.approved_leave_days, pr.payable_days, pr.created_at
+            FROM payroll_records pr
+            LEFT JOIN employees e ON pr.organization_id = e.organization_id AND pr.employee_id = e.id
+            WHERE pr.organization_id = %s AND pr.payroll_run_id = %s
+        """
+        params = [org_id, run_id]
+        if branch_id:
+            query += " AND pr.branch_id = %s"
+            params.append(branch_id)
+        query += " ORDER BY pr.id ASC;"
+        cur.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["basic_salary"] = float(r["basic_salary"] or 0)
+            r["allowances"] = float(r["allowances"] or 0)
+            r["deductions"] = float(r["deductions"] or 0)
+            r["net_salary"] = float(r["net_salary"] or 0)
+            r["payable_days"] = float(r["payable_days"] or 0)
+        return rows
+

@@ -327,13 +327,37 @@ CREATE TABLE IF NOT EXISTS leave_requests (
 
 CREATE INDEX IF NOT EXISTS idx_leaves_branch ON leave_requests(organization_id, branch_id, status);
 
--- 18. Payroll Runs
+-- 18. Overtime Records
+CREATE TABLE IF NOT EXISTS overtime_records (
+    id VARCHAR(64) NOT NULL,
+    organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    branch_id VARCHAR(64) NOT NULL,
+    employee_id VARCHAR(64) NOT NULL,
+    work_date DATE NOT NULL,
+    hours NUMERIC(8, 2) NOT NULL CHECK (hours > 0),
+    reason TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled', 'paid')),
+    approved_by VARCHAR(64),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (organization_id, id),
+    FOREIGN KEY (organization_id, branch_id) REFERENCES branches(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, employee_id) REFERENCES employees(organization_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ot_lookup ON overtime_records(organization_id, branch_id, work_date);
+CREATE INDEX IF NOT EXISTS idx_ot_emp ON overtime_records(organization_id, employee_id);
+
+-- 19. Payroll Runs
 CREATE TABLE IF NOT EXISTS payroll_runs (
     id VARCHAR(64) NOT NULL,
     organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     branch_id VARCHAR(64) NOT NULL,
+    payroll_month VARCHAR(50),
     period_start DATE NOT NULL,
     period_end DATE NOT NULL,
+    employee_count INT NOT NULL DEFAULT 0,
+    total_basic_salary NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+    total_deduction NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
     status VARCHAR(50) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved', 'paid', 'cancelled')),
     total_amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -343,7 +367,7 @@ CREATE TABLE IF NOT EXISTS payroll_runs (
 
 CREATE INDEX IF NOT EXISTS idx_payroll_runs_branch ON payroll_runs(organization_id, branch_id, period_start);
 
--- 19. Payroll Records
+-- 20. Payroll Records
 CREATE TABLE IF NOT EXISTS payroll_records (
     id VARCHAR(64) NOT NULL,
     organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -354,6 +378,12 @@ CREATE TABLE IF NOT EXISTS payroll_records (
     allowances NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     deductions NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     net_salary NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    scheduled_workdays INT NOT NULL DEFAULT 0,
+    present_days INT NOT NULL DEFAULT 0,
+    absent_days INT NOT NULL DEFAULT 0,
+    late_days INT NOT NULL DEFAULT 0,
+    approved_leave_days INT NOT NULL DEFAULT 0,
+    payable_days NUMERIC(8, 2) NOT NULL DEFAULT 0.00,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (organization_id, id),
     FOREIGN KEY (organization_id, branch_id) REFERENCES branches(organization_id, id) ON DELETE CASCADE,
@@ -898,7 +928,38 @@ CREATE POLICY p_payroll_records_tenant_isolation ON payroll_records
         )
     );
 
+-- --------------------------------------------------------------------
+-- POLICIES: OVERTIME_RECORDS
+-- --------------------------------------------------------------------
+DROP POLICY IF EXISTS p_overtime_records_tenant_isolation ON overtime_records;
+CREATE POLICY p_overtime_records_tenant_isolation ON overtime_records
+    FOR ALL
+    TO app_runtime_role
+    USING (
+        current_setting('app.is_platform_admin', true) = 'true'
+        OR (
+            organization_id = current_setting('app.current_org_id', true)
+            AND (
+                current_setting('app.current_branch_id', true) IS NULL
+                OR current_setting('app.current_branch_id', true) = ''
+                OR branch_id = current_setting('app.current_branch_id', true)
+            )
+        )
+    )
+    WITH CHECK (
+        current_setting('app.is_platform_admin', true) = 'true'
+        OR (
+            organization_id = current_setting('app.current_org_id', true)
+            AND (
+                current_setting('app.current_branch_id', true) IS NULL
+                OR current_setting('app.current_branch_id', true) = ''
+                OR branch_id = current_setting('app.current_branch_id', true)
+            )
+        )
+    );
+
 -- Grant appropriate permissions to app_runtime_role
 GRANT USAGE ON SCHEMA public TO app_runtime_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_runtime_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_runtime_role;
+

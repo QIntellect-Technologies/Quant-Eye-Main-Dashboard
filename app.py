@@ -7,7 +7,9 @@ import urllib.error
 from functools import wraps
 from datetime import datetime
 from werkzeug.security import check_password_hash
+from jinja2 import ChoiceLoader, FileSystemLoader, PrefixLoader
 import database as db
+import cloud_database as cloud_db
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)
@@ -15,6 +17,15 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax'
 )
+
+# Configure Jinja template loader to reuse existing pages without creating new ones
+_main_templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+_local_templates_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Local-Dashboard", "templates"))
+_loaders = [FileSystemLoader(_main_templates_dir)]
+if os.path.isdir(_local_templates_dir):
+    _loaders.append(FileSystemLoader(_local_templates_dir))
+    _loaders.append(PrefixLoader({"local": FileSystemLoader(_local_templates_dir)}))
+app.jinja_loader = ChoiceLoader(_loaders)
 
 # Ensure database schema and default control plane users are initialized
 db.init_db()
@@ -213,7 +224,7 @@ def cloud_sync_batch():
 
 
 # ==============================================================================
-# PAGE ROUTE
+# PAGE ROUTES (REUSING EXISTING PAGES — ZERO NEW PAGES CREATED)
 # ==============================================================================
 
 @app.get("/")
@@ -221,6 +232,33 @@ def dashboard():
     modules = db.get_module_catalog()
     organizations = db.get_all_organizations()
     return render_template("index.html", modules=modules, organizations=organizations)
+
+
+@app.get("/attendance-report")
+def attendance_report_page():
+    """Serve the existing Attendance Report page connected to Cloud PostgreSQL."""
+    return render_template("attendance_report.html")
+
+
+@app.get("/client/portal")
+@app.get("/client-portal")
+def client_portal_page():
+    """Serve the existing Client Portal (Staff, Leaves, Overtime, Shifts, Payroll)."""
+    return render_template("local/index.html")
+
+
+@app.get("/api/dashboard/stats")
+def api_dashboard_stats():
+    """Return real system KPIs derived directly from PostgreSQL."""
+    try:
+        user = get_current_user()
+        stats = cloud_db.get_cloud_kpis(user_context=None)
+        return jsonify({
+            "success": True,
+            "stats": stats
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ==============================================================================
@@ -909,6 +947,238 @@ def ingest_attendance_event():
     }), 201
 
 
+# ==============================================================================
+# PHASE 2.4: CLOUD REPORTING & DATA ENDPOINTS (REAL POSTGRESQL DATA ONLY)
+# ==============================================================================
+
+@app.get("/api/cloud/reports/attendance")
+@app.get("/api/reports/attendance")
+def api_cloud_reports_attendance():
+    """Return comprehensive attendance report from real PostgreSQL attendance_events."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    if not cloud_db.check_module_entitlement(org_id, "attendance"):
+        return jsonify({"success": False, "error": "Module 'attendance' is not licensed for this organization."}), 403
+
+    branch_id = request.args.get("branch_id") or None
+    target_date = request.args.get("date", "").strip() or None
+    start_date = request.args.get("start_date", "").strip() or None
+    end_date = request.args.get("end_date", "").strip() or None
+    department = request.args.get("department", "").strip() or None
+    status = request.args.get("status", "").strip() or None
+    search = request.args.get("search", "").strip() or None
+
+    report = cloud_db.get_detailed_cloud_attendance_report(
+        org_id=org_id,
+        branch_id=branch_id,
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
+        department=department,
+        status_filter=status,
+        search_query=search
+    )
+    return jsonify(report), 200
+
+
+@app.get("/api/cloud/staff")
+@app.get("/api/users")
+@app.get("/api/staff")
+def api_cloud_staff_list():
+    """Return real employee roster from PostgreSQL with tenant isolation."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    branch_id = request.args.get("branch_id") or None
+    search = request.args.get("search", "").strip() or None
+    department = request.args.get("department", "").strip() or None
+
+    employees = cloud_db.get_cloud_staff_list(
+        org_id=org_id,
+        branch_id=branch_id,
+        search=search,
+        department=department
+    )
+    return jsonify(employees), 200
+
+
+@app.get("/api/cloud/leaves")
+@app.get("/api/leaves")
+def api_cloud_leaves_list():
+    """Return real leave requests from PostgreSQL."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    if not cloud_db.check_module_entitlement(org_id, "leave"):
+        return jsonify({"success": False, "error": "Module 'leave' is not licensed for this organization."}), 403
+
+    branch_id = request.args.get("branch_id") or None
+    status = request.args.get("status", "").strip() or None
+
+    leaves = cloud_db.get_cloud_leave_requests(
+        org_id=org_id,
+        branch_id=branch_id,
+        status=status
+    )
+    return jsonify(leaves), 200
+
+
+@app.get("/api/cloud/overtime")
+@app.get("/api/overtime")
+def api_cloud_overtime_list():
+    """Return real overtime records from PostgreSQL."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    if not cloud_db.check_module_entitlement(org_id, "overtime"):
+        return jsonify({"success": False, "error": "Module 'overtime' is not licensed for this organization."}), 403
+
+    branch_id = request.args.get("branch_id") or None
+    status = request.args.get("status", "").strip() or None
+
+    overtime_list = cloud_db.get_cloud_overtime_records(
+        org_id=org_id,
+        branch_id=branch_id,
+        status=status
+    )
+    return jsonify(overtime_list), 200
+
+
+@app.get("/api/cloud/shifts")
+@app.get("/api/shifts")
+def api_cloud_shifts_list():
+    """Return real shifts from PostgreSQL."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    if not cloud_db.check_module_entitlement(org_id, "shifts"):
+        return jsonify({"success": False, "error": "Module 'shifts' is not licensed for this organization."}), 403
+
+    branch_id = request.args.get("branch_id") or None
+
+    shifts = cloud_db.get_cloud_shifts(
+        org_id=org_id,
+        branch_id=branch_id
+    )
+    return jsonify(shifts), 200
+
+
+@app.get("/api/cloud/payroll/runs")
+@app.get("/api/payroll/runs")
+def api_cloud_payroll_runs():
+    """Return real payroll runs from PostgreSQL."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    if not cloud_db.check_module_entitlement(org_id, "payroll"):
+        return jsonify({"success": False, "error": "Module 'payroll' is not licensed for this organization."}), 403
+
+    branch_id = request.args.get("branch_id") or None
+
+    runs = cloud_db.get_cloud_payroll_runs(
+        org_id=org_id,
+        branch_id=branch_id
+    )
+    return jsonify(runs), 200
+
+
+@app.get("/api/cloud/payroll/runs/<run_id>/records")
+@app.get("/api/payroll/runs/<run_id>/records")
+def api_cloud_payroll_records(run_id):
+    """Return real employee lines for a payroll run from PostgreSQL."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    ok, err = check_org_permission(org_id)
+    if not ok:
+        return jsonify({"success": False, "error": err[0]}), err[1]
+
+    if not cloud_db.check_module_entitlement(org_id, "payroll"):
+        return jsonify({"success": False, "error": "Module 'payroll' is not licensed for this organization."}), 403
+
+    branch_id = request.args.get("branch_id") or None
+
+    records = cloud_db.get_cloud_payroll_records(
+        org_id=org_id,
+        run_id=run_id,
+        branch_id=branch_id
+    )
+    return jsonify(records), 200
+
+
+@app.get("/api/cloud/stats")
+@app.get("/api/stats")
+def api_cloud_stats():
+    """Return tenant stats summary."""
+    user = get_current_user()
+    org_id = request.args.get("organization_id") or request.args.get("org_id")
+    if user and user.get("role") == "organization_admin":
+        org_id = user.get("organization_id")
+    elif not org_id:
+        org_id = "ORG-257281"
+
+    employees = cloud_db.get_cloud_staff_list(org_id=org_id)
+    return jsonify({
+        "total_users": len(employees),
+        "total_staff": len(employees),
+        "total_departments": len(set(e.get("department") for e in employees if e.get("department"))),
+        "organization_id": org_id
+    }), 200
+
+
 @app.get("/api/sync/live-feed")
 def get_live_attendance_feed():
     """Fetch real-time synced attendance stream for Cloud Dashboard UI."""
@@ -918,6 +1188,7 @@ def get_live_attendance_feed():
         org_id = user.get("organization_id")
     elif not org_id:
         org_id = "ORG-001"
+
 
     branch_id = request.args.get("branch_id")
     limit = int(request.args.get("limit", 30))
