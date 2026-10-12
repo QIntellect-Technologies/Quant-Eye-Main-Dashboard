@@ -463,8 +463,13 @@
       target.innerHTML=sorted.length?sorted.map(org=>`<tr><td><div class="org-name">${esc(org.name)}</div></td><td class="build-org-action"><button class="btn-outline build-org-view-btn" data-action="view-build-history" data-id="${esc(org.id)}"><i class="fa-solid fa-eye" aria-hidden="true"></i><span>View</span></button></td></tr>`).join(""):`<tr><td colspan="2" class="empty">${organizations.length?"No organizations match your search.":"Create an organization before managing builds."}</td></tr>`
     }
     function renderOrganizationBuildHistoryPage(){
-      const org=organizations.find(item=>item.id===selectedBuildHistoryOrg),title=document.getElementById("organizationBuildHistoryTitle");if(!title)return;
-      if(!org){title.textContent="Build History";document.getElementById("organizationBuildHistorySubtitle").textContent="Select an organization to see build history.";document.getElementById("organizationHistoryBuildButton").hidden=true;document.getElementById("buildBranchSummary").innerHTML="";document.getElementById("legacyBuildNotice").innerHTML="";document.getElementById("buildRows").innerHTML='<tr><td colspan="7" class="empty">This organization is no longer available.</td></tr>';return}
+      let org=organizations.find(item=>item.id===selectedBuildHistoryOrg);
+      if(!org && organizations.length > 0){
+        org = organizations[0];
+        selectedBuildHistoryOrg = org.id;
+      }
+      const title=document.getElementById("organizationBuildHistoryTitle");if(!title)return;
+      if(!org){title.textContent="Build History";document.getElementById("organizationBuildHistorySubtitle").textContent="Select an organization to see build history.";document.getElementById("organizationHistoryBuildButton").hidden=true;document.getElementById("buildBranchSummary").innerHTML="";document.getElementById("legacyBuildNotice").innerHTML="";document.getElementById("buildRows").innerHTML='<tr><td colspan="7" class="empty">No organizations available. Create an organization to view build history.</td></tr>';return}
       const createBuildButton=document.getElementById("organizationHistoryBuildButton");createBuildButton.hidden=org.status!=="Active";createBuildButton.dataset.id=org.id;title.textContent=`${org.name} · Build History`;document.getElementById("organizationBuildHistorySubtitle").textContent=`${org.id} · Branch build versions and latest build status`;
       const branchFilter=document.getElementById("buildBranchFilter"),selectedBranch=branchFilter.value||"all";
       branchFilter.innerHTML=`<option value="all">All branches</option>${org.branches.map(branch=>`<option value="${esc(branch.id)}">${esc(branch.name)}</option>`).join("")}`;
