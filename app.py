@@ -1014,6 +1014,41 @@ def ingest_attendance_event():
 
     event_id = db.record_live_attendance_sync_event(event_payload)
 
+    # Ingest into PostgreSQL attendance_events table if cloud PostgreSQL is connected
+    if cloud_db:
+        try:
+            with cloud_db.tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
+                ev_uid = str(event_payload.get("user_id") or "1")
+                # Look up or ensure employee exists in PostgreSQL
+                cur.execute("SELECT id FROM employees WHERE organization_id = %s AND (id = %s OR employee_code = %s);", (org_id, ev_uid, ev_uid))
+                emp_row = cur.fetchone()
+                emp_id = emp_row["id"] if emp_row else ev_uid
+                if not emp_row:
+                    cur.execute("""
+                        INSERT INTO employees (id, organization_id, branch_id, employee_code, name, is_active)
+                        VALUES (%s, %s, %s, %s, %s, TRUE)
+                        ON CONFLICT (organization_id, id) DO NOTHING;
+                    """, (emp_id, org_id, branch_id, ev_uid, event_payload.get("name", "Employee")))
+
+                cur.execute("""
+                    INSERT INTO attendance_events (
+                        id, organization_id, branch_id, employee_id, camera_id, timestamp, event_type, confidence, sync_status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, 'CHECK_IN', %s, 'synced')
+                    ON CONFLICT (organization_id, id) DO NOTHING;
+                """, (
+                    f"EVT-{event_id or secrets.token_hex(6)}",
+                    org_id,
+                    branch_id,
+                    emp_id,
+                    event_payload.get("camera_id") or "edge_node",
+                    event_payload.get("timestamp") or datetime.now().isoformat(),
+                    float(event_payload.get("confidence") or 1.0)
+                ))
+        except Exception as pg_err:
+            logger_app = getattr(cloud_db, "logger", None)
+            if logger_app:
+                logger_app.warning("Could not persist attendance event to PG: %s", pg_err)
+
     # Immediately relay to Local Dashboard so the client's Attendance Report updates in real-time
     try:
         query_local_dashboard("/api/attendance/edge-mark", method="POST", payload=event_payload)
