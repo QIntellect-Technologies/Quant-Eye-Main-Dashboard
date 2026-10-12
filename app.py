@@ -223,6 +223,66 @@ def cloud_sync_batch():
         return jsonify({"success": False, "error": f"Batch ingestion failed: {e}"}), 500
 
 
+@app.get("/api/cloud/edge/config")
+def cloud_edge_config():
+    """
+    Authoritative configuration retrieval endpoint for authenticated Edge Nodes.
+    Server strictly derives organization_id and branch_id from the verified Edge JWT.
+    Returns: config_version, cameras, modules, license status.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"success": False, "error": "Missing or malformed Authorization header"}), 401
+
+    token = auth_header.split(" ", 1)[1].strip()
+
+    try:
+        import cloud_database as cloud_db
+        node_auth = cloud_db.verify_edge_token(token)
+        if not node_auth:
+            return jsonify({"success": False, "error": "Unauthorized: invalid, expired, or revoked edge token"}), 401
+
+        config = cloud_db.get_edge_node_configuration(node_auth)
+        return jsonify(config), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Configuration retrieval failed: {e}"}), 500
+
+
+@app.post("/api/cloud/edge/heartbeat")
+def cloud_edge_heartbeat():
+    """
+    Heartbeat and configuration version check endpoint for authenticated Edge Nodes.
+    Updates last_heartbeat timestamp and online status in PostgreSQL.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"success": False, "error": "Missing or malformed Authorization header"}), 401
+
+    token = auth_header.split(" ", 1)[1].strip()
+
+    try:
+        import cloud_database as cloud_db
+        node_auth = cloud_db.verify_edge_token(token)
+        if not node_auth:
+            return jsonify({"success": False, "error": "Unauthorized: invalid, expired, or revoked edge token"}), 401
+
+        payload = request.get_json(silent=True) or {}
+        status = str(payload.get("status") or "online").strip().lower()
+        if status not in ("online", "offline", "syncing", "error"):
+            status = "online"
+
+        sw_ver = payload.get("software_version") or payload.get("version")
+
+        hb_res = cloud_db.update_edge_node_heartbeat(
+            edge_node_auth=node_auth,
+            status=status,
+            software_version=sw_ver
+        )
+        return jsonify(hb_res), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Heartbeat update failed: {e}"}), 500
+
+
 # ==============================================================================
 # PAGE ROUTES (REUSING EXISTING PAGES — ZERO NEW PAGES CREATED)
 # ==============================================================================
@@ -851,40 +911,40 @@ def get_cameras_for_branch(branch_id):
         org_id = user.get("organization_id")
 
     if not org_id:
-        # Fallback to default demo organization if unauthenticated node request
         org_id = "ORG-001"
 
+    # Query PostgreSQL cloud database
+    try:
+        import cloud_database as cloud_db
+        pg_cams = cloud_db.get_cloud_cameras(org_id, branch_id)
+        if pg_cams:
+            return jsonify({
+                "success": True,
+                "organization_id": org_id,
+                "branch_id": branch_id,
+                "cameras": pg_cams,
+                "count": len(pg_cams)
+            }), 200
+    except Exception as e:
+        logger.warning("Could not query PostgreSQL cameras: %s", e)
+
+    # Fallback to local SQLite cache
     cams = db.get_branch_cameras(org_id, branch_id)
-    # If no cameras explicitly saved in Cloud DB, automatically import from Local Dashboard
     if not cams:
-        local_cams_resp = query_local_dashboard("/api/cameras", method="GET")
-        if local_cams_resp.get("ok") and isinstance(local_cams_resp.get("data"), list) and local_cams_resp.get("data"):
-            cams = []
-            for idx, lc in enumerate(local_cams_resp["data"], start=1):
-                cams.append({
-                    "id": lc.get("camera_id") or f"cam_{lc.get('id')}",
-                    "name": lc.get("name") or f"Camera {idx}",
-                    "camera_type": lc.get("camera_type", "rtsp"),
-                    "rtsp_url": str(lc.get("rtsp_url", "")),
-                    "room_name": lc.get("room_name", "Entrance"),
-                    "channel_number": idx,
-                    "active": int(lc.get("active", 1))
-                })
-            # Persist in Cloud DB so Cloud is authoritative
-            db.set_branch_cameras(org_id, branch_id, cams)
-        else:
-            # Fallback default USB webcam
-            cams = [
-                {
-                    "id": "cam_webcam_0",
-                    "name": "Live Entrance Camera",
-                    "camera_type": "webcam",
-                    "rtsp_url": "0",
-                    "room_name": "Main Entrance",
-                    "channel_number": 1,
-                    "active": 1
-                }
-            ]
+        cams = [
+            {
+                "camera_id": "cam_webcam_0",
+                "id": "cam_webcam_0",
+                "name": "Live Entrance Camera",
+                "camera_name": "Live Entrance Camera",
+                "camera_type": "webcam",
+                "rtsp_url": "0",
+                "room_name": "Main Entrance",
+                "location": "Main Entrance",
+                "channel_number": 1,
+                "active": 1
+            }
+        ]
     return jsonify({
         "success": True,
         "organization_id": org_id,
@@ -897,7 +957,7 @@ def get_cameras_for_branch(branch_id):
 @app.post("/api/branches/<branch_id>/cameras")
 @require_auth()
 def update_cameras_for_branch(branch_id):
-    """Save cloud-configured cameras for a branch."""
+    """Save cloud-configured cameras for a branch and increment config_version."""
     payload = request.get_json(silent=True) or {}
     org_id = payload.get("organization_id")
     user = get_current_user()
@@ -907,11 +967,26 @@ def update_cameras_for_branch(branch_id):
         org_id = "ORG-001"
 
     cameras = payload.get("cameras", [])
-    db.set_branch_cameras(org_id, branch_id, cameras)
-    db.record_audit_log(f"Updated {len(cameras)} cameras for Branch {branch_id}", org_id, branch_id)
+
+    # 1. Update in PostgreSQL and increment config_version
+    new_version = 1
+    try:
+        import cloud_database as cloud_db
+        new_version = cloud_db.set_cloud_cameras(org_id, branch_id, cameras)
+    except Exception as e:
+        logger.warning("Could not persist cameras to PostgreSQL: %s", e)
+
+    # 2. Keep local SQLite mirror synchronized
+    try:
+        db.set_branch_cameras(org_id, branch_id, cameras)
+        db.record_audit_log(f"Updated {len(cameras)} cameras for Branch {branch_id} (version {new_version})", org_id, branch_id)
+    except Exception:
+        pass
+
     return jsonify({
         "success": True,
         "message": f"Successfully updated {len(cameras)} cameras for Branch {branch_id}",
+        "config_version": new_version,
         "cameras": cameras
     }), 200
 

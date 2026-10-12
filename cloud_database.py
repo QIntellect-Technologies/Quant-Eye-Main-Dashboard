@@ -800,6 +800,248 @@ def ingest_edge_sync_batch(
 
 
 # =====================================================================
+# PHASE 2.5: CLOUD -> EDGE CONFIGURATION SYNCHRONIZATION & HEARTBEAT
+# =====================================================================
+
+def update_edge_node_heartbeat(
+    edge_node_auth: Dict[str, Any],
+    status: str = "online",
+    software_version: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Update edge node heartbeat, status, and optional software version.
+    Returns current configuration version so edge can detect drift.
+    """
+    org_id = edge_node_auth["organization_id"]
+    branch_id = edge_node_auth["branch_id"]
+    node_id = edge_node_auth["edge_node_id"]
+
+    with tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
+        # Update heartbeat and status
+        if software_version:
+            cur.execute("""
+                UPDATE edge_nodes
+                SET last_heartbeat = CURRENT_TIMESTAMP,
+                    status = %s,
+                    software_version = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE organization_id = %s AND id = %s;
+            """, (status, software_version, org_id, node_id))
+        else:
+            cur.execute("""
+                UPDATE edge_nodes
+                SET last_heartbeat = CURRENT_TIMESTAMP,
+                    status = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE organization_id = %s AND id = %s;
+            """, (status, org_id, node_id))
+
+        # Query branch config_version
+        cur.execute("""
+            SELECT config_version, access
+            FROM branches
+            WHERE organization_id = %s AND id = %s;
+        """, (org_id, branch_id))
+        branch_info = cur.fetchone()
+        cfg_ver = branch_info["config_version"] if branch_info else 1
+        branch_access = branch_info["access"] if branch_info else "Active"
+
+        return {
+            "success": True,
+            "edge_node_id": node_id,
+            "organization_id": org_id,
+            "branch_id": branch_id,
+            "status": status,
+            "config_version": cfg_ver,
+            "branch_status": branch_access.lower(),
+            "server_time": datetime.now(timezone.utc).isoformat()
+        }
+
+
+def get_edge_node_configuration(edge_node_auth: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Retrieve authoritative branch configuration for an authenticated Edge Node.
+    Resolves ONLY the edge node's assigned organization and branch.
+    Never exposes sensitive unhashed credentials or cross-tenant data.
+    """
+    org_id = edge_node_auth["organization_id"]
+    branch_id = edge_node_auth["branch_id"]
+    node_id = edge_node_auth["edge_node_id"]
+
+    with tenant_context(org_id=org_id, branch_id=branch_id, enforce_rls=False) as cur:
+        # 1. Fetch organization details
+        cur.execute("SELECT id, name, status FROM organizations WHERE id = %s;", (org_id,))
+        org_row = cur.fetchone()
+        org_name = org_row["name"] if org_row else "Unknown Organization"
+        org_status = org_row["status"] if org_row else "Active"
+
+        # 2. Fetch branch details & config_version
+        cur.execute("""
+            SELECT id, name, access, config_version, grace_days, token_expires_at
+            FROM branches
+            WHERE organization_id = %s AND id = %s;
+        """, (org_id, branch_id))
+        br_row = cur.fetchone()
+        if not br_row:
+            raise ValueError(f"Branch '{branch_id}' not found for organization '{org_id}'")
+
+        branch_name = br_row["name"]
+        branch_access = br_row["access"] or "Active"
+        config_version = br_row["config_version"] or 1
+
+        # 3. Fetch active license
+        cur.execute("""
+            SELECT id, status, tier, starts_at, expires_at
+            FROM organization_licenses
+            WHERE organization_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1;
+        """, (org_id,))
+        lic_row = cur.fetchone()
+
+        license_info = {
+            "license_id": lic_row["id"] if lic_row else "LIC-DEFAULT",
+            "license_status": lic_row["status"] if lic_row else "active",
+            "plan_tier": lic_row["tier"] if lic_row else "standard",
+            "starts_at": lic_row["starts_at"].isoformat() if lic_row and lic_row["starts_at"] else None,
+            "expires_at": lic_row["expires_at"].isoformat() if lic_row and lic_row["expires_at"] else None
+        }
+
+        # If branch is suspended, reflect suspended state
+        if branch_access in ("Suspended", "suspended"):
+            license_info["license_status"] = "suspended"
+
+        # 4. Fetch enabled modules for organization
+        cur.execute("""
+            SELECT module_id
+            FROM organization_modules
+            WHERE organization_id = %s AND is_enabled = TRUE;
+        """, (org_id,))
+        enabled_modules = [r["module_id"] for r in cur.fetchall()]
+        if not enabled_modules:
+            enabled_modules = ["attendance"]
+
+        # 5. Fetch configured cameras for this branch
+        cur.execute("""
+            SELECT 
+                id as camera_id,
+                camera_name as name,
+                location,
+                COALESCE(room_name, location) as room_name,
+                COALESCE(camera_type, 'rtsp') as camera_type,
+                rtsp_url,
+                COALESCE(channel_number, 1) as channel_number,
+                CASE WHEN is_active THEN 1 ELSE 0 END as active
+            FROM cameras
+            WHERE organization_id = %s AND branch_id = %s
+            ORDER BY created_at ASC;
+        """, (org_id, branch_id))
+        raw_cameras = [dict(c) for c in cur.fetchall()]
+
+        # Filter and structure cameras safely
+        cameras = []
+        for idx, c in enumerate(raw_cameras, start=1):
+            cameras.append({
+                "camera_id": str(c["camera_id"]),
+                "name": str(c["name"]),
+                "room_name": str(c["room_name"] or c["location"] or f"Room {idx}"),
+                "camera_type": str(c["camera_type"] or "rtsp"),
+                "rtsp_url": str(c["rtsp_url"]),
+                "channel_number": int(c.get("channel_number") or idx),
+                "active": int(c["active"])
+            })
+
+        # Update edge_node config_version and last sync time
+        cur.execute("""
+            UPDATE edge_nodes
+            SET config_version = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE organization_id = %s AND id = %s;
+        """, (config_version, org_id, node_id))
+
+        return {
+            "success": True,
+            "edge_node_id": node_id,
+            "organization_id": org_id,
+            "organization_name": org_name,
+            "branch_id": branch_id,
+            "branch_name": branch_name,
+            "branch_status": branch_access.lower(),
+            "config_version": config_version,
+            "license": license_info,
+            "licensed_modules": enabled_modules,
+            "cameras": cameras,
+            "camera_count": len(cameras),
+            "synced_at": datetime.now(timezone.utc).isoformat()
+        }
+
+
+def get_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]:
+    """Fetch real cameras from PostgreSQL for an organization and branch."""
+    with tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute("""
+            SELECT 
+                id as camera_id,
+                camera_name as name,
+                location,
+                COALESCE(room_name, location) as room_name,
+                COALESCE(camera_type, 'rtsp') as camera_type,
+                rtsp_url,
+                COALESCE(channel_number, 1) as channel_number,
+                CASE WHEN is_active THEN 1 ELSE 0 END as active,
+                created_at,
+                updated_at
+            FROM cameras
+            WHERE organization_id = %s AND branch_id = %s
+            ORDER BY created_at ASC;
+        """, (org_id, branch_id))
+        return [dict(c) for c in cur.fetchall()]
+
+
+def set_cloud_cameras(org_id: str, branch_id: str, cameras: List[Dict[str, Any]]) -> int:
+    """
+    Replace or update configured cameras for an organization and branch in PostgreSQL.
+    Atomically increments branch config_version so edge nodes automatically detect the update.
+    Returns the new config_version.
+    """
+    with tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
+        # Delete existing cameras for branch
+        cur.execute("DELETE FROM cameras WHERE organization_id = %s AND branch_id = %s;", (org_id, branch_id))
+
+        # Insert updated camera list
+        for idx, cam in enumerate(cameras, start=1):
+            cam_id = str(cam.get("camera_id") or cam.get("id") or f"cam_{uuid.uuid4().hex[:8]}")
+            cam_name = str(cam.get("name") or cam.get("camera_name") or f"Camera #{idx}")
+            cam_type = str(cam.get("camera_type") or "rtsp")
+            rtsp = str(cam.get("rtsp_url") or "0")
+            room = str(cam.get("room_name") or cam.get("location") or "Main Area")
+            ch_num = int(cam.get("channel_number") or idx)
+            is_act = bool(cam.get("active", 1) in (1, True, "1", "true"))
+
+            cur.execute("""
+                INSERT INTO cameras (
+                    id, organization_id, branch_id, camera_name,
+                    camera_type, rtsp_url, location, room_name,
+                    channel_number, is_active, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP);
+            """, (cam_id, org_id, branch_id, cam_name, cam_type, rtsp, room, room, ch_num, is_act))
+
+        # Increment branch config_version
+        cur.execute("""
+            UPDATE branches
+            SET config_version = config_version + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE organization_id = %s AND id = %s
+            RETURNING config_version;
+        """, (org_id, branch_id))
+        row = cur.fetchone()
+        new_version = row["config_version"] if row else 1
+
+        return new_version
+
+
+# =====================================================================
 # PHASE 2.4: CONNECT EXISTING PAGES TO REAL CLOUD POSTGRESQL DATA
 # Real Data Only — No Fake Data — Strict Tenant Isolation
 # =====================================================================
