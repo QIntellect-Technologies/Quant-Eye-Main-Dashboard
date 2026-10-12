@@ -1019,7 +1019,15 @@ def get_cameras_for_branch(branch_id):
     # 2. Query Client Portal / Local Dashboard API (where client configured RTSP/NVR cameras)
     try:
         portal_url = LOCAL_DASHBOARD_URL.rstrip('/')
-        req = urllib.request.Request(f"{portal_url}/api/cameras?active_only=true", headers={"User-Agent": "QuantEye-Main-Dashboard"})
+        portal_headers = {
+            "User-Agent": "QuantEye-Main-Dashboard",
+            "X-Organization-Id": org_id,
+            "X-Branch-Id": branch_id
+        }
+        req = urllib.request.Request(
+            f"{portal_url}/api/cameras?active_only=true&organization_id={urllib.parse.quote(org_id)}&branch_id={urllib.parse.quote(branch_id)}",
+            headers=portal_headers
+        )
         with urllib.request.urlopen(req, timeout=3.5) as resp:
             if resp.status == 200:
                 p_cams = json.loads(resp.read().decode('utf-8'))
