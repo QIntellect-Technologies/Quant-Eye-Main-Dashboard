@@ -423,9 +423,9 @@ def init_db() -> bool:
                     "v1.0.1", "succeeded", 100, manifest_json, json.dumps(o_modules)
                 ))
 
-        _seed_org("ORG-001", "Demo Organization", "Technology", "contact@demo-org.com", "+92 300 1234567", "Tech Park, Suite 402", 38, ["attendance", "shifts", "overtime", "leave", "payroll"], "KEY-DEMO-001-BR01", "admin@demo-org.com", "admin123")
-        _seed_org("ORG-311376", "Hello World", "Technology", "helloworld@gmail.com", "0300-2394422", "Tech City, Block B", 100, ["attendance", "shifts", "payroll"], "QE-HW-9B71C8", "helloworld@gmail.com", "admin123")
-        _seed_org("ORG-257281", "Optimum Tech", "Technology", "optimumtech@gmail.com", "0300-3823923", "Silicon Plaza, Fl 2", 38, ["attendance", "shifts", "payroll"], "QE-9A5DDEE7B01A41C18B2F", "optimumtech@gmail.com", "Pass1234!")
+        # NOTE: Demo organization auto-seeding has been intentionally removed.
+        # Organizations are now created exclusively through the UI or API.
+        # This prevents deleted organizations from reappearing after a server restart.
 
         conn.commit()
 

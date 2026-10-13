@@ -436,8 +436,17 @@ def update_organization(org_id):
 @require_auth(allowed_roles=['platform_admin'])
 def delete_organization(org_id):
     try:
+        # Delete from SQLite (local fallback DB)
         success = db.delete_organization(org_id)
-        if not success:
+
+        # Delete from PostgreSQL cloud DB (prevents orgs from reappearing after restart)
+        if _HAS_CLOUD_DB:
+            try:
+                cloud_db.delete_organization(org_id)
+            except Exception as ce:
+                logger.warning(f"cloud_db.delete_organization failed for {org_id}: {ce}")
+
+        if not success and not _HAS_CLOUD_DB:
             return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
 
         # Also purge organization's data from Client Portal (Local Dashboard)

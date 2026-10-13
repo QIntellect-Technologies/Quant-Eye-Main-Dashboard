@@ -383,6 +383,17 @@ def list_organizations(user_context: Optional[CloudUser] = None) -> List[Dict[st
         cur.execute("SELECT * FROM organizations ORDER BY name ASC;")
         return [dict(r) for r in cur.fetchall()]
 
+def delete_organization(org_id: str, user_context: Optional[CloudUser] = None) -> bool:
+    """Permanently delete an organization and all cascading data from PostgreSQL."""
+    is_plat = user_context.is_platform_admin if user_context else True
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=is_plat) as cur:
+        cur.execute("SELECT id FROM organizations WHERE id = %s;", (org_id,))
+        if not cur.fetchone():
+            return False
+        # Cascade: branches, users, modules, licenses, branding, attendance, etc.
+        cur.execute("DELETE FROM organizations WHERE id = %s;", (org_id,))
+        return True
+
 # --- Branches ---
 def create_branch(
     org_id: str,
