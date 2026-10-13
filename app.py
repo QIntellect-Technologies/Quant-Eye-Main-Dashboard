@@ -418,6 +418,21 @@ def delete_organization(org_id):
         success = db.delete_organization(org_id)
         if not success:
             return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
+
+        # Also purge organization's data from Client Portal (Local Dashboard)
+        try:
+            import urllib.request
+            portal_url = os.environ.get("CLIENT_PORTAL_URL", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
+            purge_req = urllib.request.Request(
+                f"{portal_url}/api/organizations/{org_id}/purge",
+                data=b"{}",
+                headers={"Content-Type": "application/json", "X-Client-Auth": "true"},
+                method="POST"
+            )
+            urllib.request.urlopen(purge_req, timeout=5.0)
+        except Exception as pe:
+            logger.debug(f"Note notifying client portal to purge organization {org_id}: {pe}")
+
         return jsonify({"success": True, "message": f"Organization '{org_id}' deleted."})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
