@@ -1404,6 +1404,9 @@ def ensure_default_users() -> None:
                     (password_hash, role, organization_id, existing["id"]),
                 )
             else:
+                cursor.execute("SELECT 1 FROM control_plane_users WHERE id = ?", (user_id,))
+                if cursor.fetchone():
+                    user_id = f"{user_id}-{uuid.uuid4().hex[:12].upper()}"
                 cursor.execute(
                     "INSERT INTO control_plane_users (id, name, email, password_hash, role, organization_id, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
                     (user_id, name, email, password_hash, role, organization_id),

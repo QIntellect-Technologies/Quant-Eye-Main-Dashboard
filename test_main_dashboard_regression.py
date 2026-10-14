@@ -142,6 +142,41 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertEqual(data["user"]["role"], "organization_admin")
         self.assertEqual(data["user"]["organization_id"], "ORG-001")
 
+    def test_bootstrap_uses_unique_id_when_configured_email_changes(self):
+        """An old bootstrap ID must not crash startup for a newly configured admin email."""
+        platform_admin = db.get_user_by_id("USR-PLATFORM-ADMIN")
+        self.assertIsNotNone(platform_admin)
+        configured_email = "new-admin@example.test"
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE control_plane_users SET email = ? WHERE id = ?",
+                ("previous-admin@example.test", "USR-PLATFORM-ADMIN"),
+            )
+        try:
+            with patch.dict(os.environ, {
+                "PLATFORM_ADMIN_EMAIL": configured_email,
+                "PLATFORM_ADMIN_PASSWORD": "strong-test-password",
+                "ORGANIZATION_ADMIN_EMAIL": "",
+                "ORGANIZATION_ADMIN_PASSWORD": "",
+                "ORGANIZATION_ADMIN_ORG_ID": "",
+            }):
+                db.ensure_default_users()
+
+            new_admin = db.get_user_by_email(configured_email)
+            self.assertIsNotNone(new_admin)
+            self.assertNotEqual(new_admin["id"], "USR-PLATFORM-ADMIN")
+            self.assertEqual(
+                db.get_user_by_id("USR-PLATFORM-ADMIN")["email"],
+                "previous-admin@example.test",
+            )
+        finally:
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM control_plane_users WHERE email = ?", (configured_email,))
+                conn.execute(
+                    "UPDATE control_plane_users SET email = ? WHERE id = ?",
+                    (platform_admin["email"], "USR-PLATFORM-ADMIN"),
+                )
+
     def test_05_client_auth_uses_hashed_build_credentials_and_branch_binding(self):
         """Only the provisioned build password and its matching branch may authenticate."""
         build_password = "RegressionBuild!Password-2026"
