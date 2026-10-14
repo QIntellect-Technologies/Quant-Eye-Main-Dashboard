@@ -99,6 +99,11 @@ class TestMainDashboardRegression(unittest.TestCase):
         with self.client.session_transaction() as session:
             session.clear()
 
+        page_res = self.client.get("/")
+        self.assertEqual(page_res.status_code, 200)
+        self.assertIn(b'<body class="auth-required">', page_res.data)
+        self.assertIn(b'id="loginModal"', page_res.data)
+
         protected_res = self.client.get("/api/organizations")
         self.assertEqual(protected_res.status_code, 401)
         profile_res = self.client.get("/api/auth/me")
@@ -119,6 +124,8 @@ class TestMainDashboardRegression(unittest.TestCase):
         data = res.get_json()
         self.assertTrue(data.get("success"))
         self.assertEqual(data["user"]["role"], "platform_admin")
+        page_res = self.client.get("/")
+        self.assertNotIn(b'<body class="auth-required">', page_res.data)
 
     def test_04_auth_login_org_admin(self):
         """Verify /api/auth/login works for Org Admin."""

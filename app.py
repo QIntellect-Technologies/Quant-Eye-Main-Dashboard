@@ -424,9 +424,13 @@ def cloud_edge_heartbeat():
 
 @app.get("/")
 def dashboard():
-    modules = db.get_module_catalog()
-    organizations = db.get_all_organizations()
-    return render_template("index.html", modules=modules, organizations=organizations)
+    is_authenticated = get_current_user() is not None
+    return render_template(
+        "index.html",
+        modules=db.get_module_catalog() if is_authenticated else [],
+        organizations=db.get_all_organizations() if is_authenticated else [],
+        is_authenticated=is_authenticated,
+    )
 
 
 @app.get("/attendance-report")

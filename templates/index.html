@@ -70,8 +70,17 @@
     .branch-row{grid-template-columns:repeat(4,minmax(0,1fr))}.branch-contact-fields{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.branch-contact-fields>div{min-width:0}.branch-row>[data-action="remove-branch"]{grid-column:4;justify-self:end}.unassigned-invoice-list{display:grid;gap:8px;margin-top:12px}.unassigned-invoice-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--line);border-radius:9px}.unassigned-invoice-row small{display:block;color:var(--muted)}@media(max-width:900px){.branch-row{grid-template-columns:repeat(2,minmax(0,1fr))}.branch-row>[data-action="remove-branch"]{grid-column:2}.branch-contact-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.branch-contact-fields{grid-template-columns:minmax(0,1fr)}.branch-row>[data-action="remove-branch"]{grid-column:1/-1;justify-self:start}.unassigned-invoice-row{align-items:flex-start;flex-direction:column}}
     .dashboard-table-wrap{width:100%;overflow-x:auto}.overview-organization-table{min-width:860px}.overview-build-table{min-width:880px}.invoice-table{min-width:1120px}.overview-organization-table td,.overview-build-table td,.invoice-table td{vertical-align:middle}.invoice-table td:last-child,.overview-build-table td:last-child,.build-table td:last-child{width:250px;min-width:250px}.build-table:not(.overview-build-table) td:last-child{width:340px;min-width:340px}.invoice-actions,.build-actions{display:grid!important;align-items:center;justify-content:start;gap:8px;min-width:0;width:max-content;min-height:0;white-space:nowrap;flex-wrap:initial}.invoice-actions{grid-template-columns:repeat(2,max-content)}.build-actions{grid-template-columns:repeat(3,max-content)}.invoice-actions .btn-outline,.build-actions .btn-outline{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;gap:6px;width:max-content;min-width:82px;white-space:nowrap}.build-organization-table{table-layout:fixed}.build-organization-table th:first-child,.build-organization-table td:first-child{width:auto}.build-organization-table th:last-child,.build-organization-table td.build-org-action{width:250px;min-width:250px;text-align:left}.build-org-view-btn{display:inline-flex!important;align-items:center;justify-content:center;gap:7px;width:auto!important;min-width:88px;white-space:nowrap}.branch-access-heading-icon{display:inline-block;width:1em;height:1em;margin-right:2px;vertical-align:-.08em;line-height:1}
   </style>
+<style>
+  body.auth-required { min-height:100vh; overflow:hidden; background:#eef8ff; }
+  body.auth-required .sidebar, body.auth-required .main { display:none !important; }
+  body.auth-required #loginModal {
+    position:fixed; inset:0; display:grid !important; place-items:center;
+    background:#eef8ff; z-index:99999; padding:24px;
+  }
+  body.auth-required #loginModal .modal-box { box-shadow:0 24px 70px #17304224; }
+</style>
 </head>
-<body>
+<body class="{% if not is_authenticated %}auth-required{% endif %}">
   <section id="productGate" class="dashboard-gate">
     <div class="dashboard-gate-card">
       <img class="dashboard-gate-logo" src="/static/Logo.png" alt="QIntellect Technologies logo">
@@ -227,6 +236,7 @@
           }
           const loginM = document.getElementById("loginModal");
           if(loginM) loginM.style.display = "none";
+          document.body.classList.remove("auth-required");
           // If Org Admin, restrict create buttons
           if(currentUser.role === 'organization_admin'){
             document.querySelectorAll('[data-action="create"]').forEach(el => el.style.display = "none");
@@ -243,6 +253,7 @@
     }
 
     function showLoginModal(){
+      document.body.classList.add("auth-required");
       const modal = document.getElementById("loginModal");
       if(modal){
         modal.style.display = "grid";
@@ -265,10 +276,7 @@
         const data = await res.json();
         if(res.ok && data.success){
           currentUser = data.user;
-          document.getElementById("loginModal").style.display = "none";
-          notify("Logged in successfully as " + currentUser.name);
-          await reloadData();
-          await checkAuth();
+          location.reload();
         } else {
           errBox.textContent = data.error || "Invalid login credentials";
           errBox.style.display = "block";
@@ -282,8 +290,12 @@
     async function handleLogout(e){
       if(e) e.stopPropagation();
       try{
-        await fetch("/api/auth/logout", {method: "POST"});
-      }catch(err){}
+        const res = await fetch("/api/auth/logout", {method: "POST"});
+        if(!res.ok) throw new Error(`Logout failed (HTTP ${res.status}).`);
+      }catch(err){
+        notify(err.message || "Logout failed. Please try again.");
+        return;
+      }
       location.reload();
     }
     const MODULES=[
