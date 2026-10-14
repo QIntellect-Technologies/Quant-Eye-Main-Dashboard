@@ -474,9 +474,14 @@ def init_db() -> bool:
 
     if _HAS_CLOUD_DB and cloud_db.postgres_is_configured():
         try:
+            cloud_db.ensure_portal_slug_column()
             cloud_db.init_cloud_db()
         except Exception as e:
             logger.warning("cloud_db init failed during init_db: %s", e)
+            try:
+                cloud_db.ensure_portal_slug_column()
+            except Exception as migrate_error:
+                logger.warning("portal_slug migration failed: %s", migrate_error)
     elif _HAS_CLOUD_DB:
         logger.info("PostgreSQL is not configured; SQLite remains the control-plane store.")
 

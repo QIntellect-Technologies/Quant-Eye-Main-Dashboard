@@ -489,39 +489,40 @@ def client_portal_page():
 
 @app.get("/api/dashboard/stats")
 def api_dashboard_stats():
-    """Return real system KPIs derived directly from PostgreSQL, falling back safely to SQLite control plane stats."""
+    """Control-plane KPIs come from live organizations, not an empty Postgres replica."""
     try:
-        user = get_current_user()
-        if not _postgres_ready():
-            raise RuntimeError("PostgreSQL replica is not configured")
-        stats = cloud_db.get_cloud_kpis(user_context=None)
-        return jsonify({
-            "success": True,
-            "stats": stats
-        })
-    except Exception as e:
-        logger.warning("Could not query PostgreSQL KPIs, using control plane fallback: %s", e)
-        try:
-            orgs = db.get_all_organizations()
-            total_orgs = len(orgs)
-            active_orgs = sum(1 for o in orgs if o.get('status') == 'active')
-            total_branches = sum(len(o.get('branches', [])) for o in orgs)
-            builds = db.get_all_builds()
-            return jsonify({
-                "success": True,
-                "stats": {
-                    "total_organizations": total_orgs,
-                    "active_organizations": active_orgs,
-                    "total_branches": total_branches,
-                    "total_builds": len(builds),
-                    "total_users": 0,
-                    "total_cameras": 0,
-                    "today_attendance": 0,
-                    "sync_rate": 100.0
-                }
-            }), 200
-        except Exception as inner_e:
-            return jsonify({"success": False, "error": str(inner_e)}), 500
+        orgs = db.get_all_organizations()
+        total_orgs = len(orgs)
+        active_orgs = sum(1 for o in orgs if str(o.get("status") or "").strip().lower() == "active")
+        total_branches = sum(len(o.get("branches", [])) for o in orgs)
+        builds = db.get_all_builds()
+        modules = db.get_module_catalog()
+        stats = {
+            "total_organizations": total_orgs,
+            "active_organizations": active_orgs,
+            "organizations_total": total_orgs,
+            "organizations_active": active_orgs,
+            "total_branches": total_branches,
+            "total_builds": len(builds),
+            "builds_total": len(builds),
+            "modules_total": len(modules),
+            "total_users": 0,
+            "total_cameras": 0,
+            "today_attendance": 0,
+            "sync_rate": 100.0,
+            "employees_total": 0,
+            "events_total": 0,
+        }
+        if _postgres_ready():
+            try:
+                cloud_stats = cloud_db.get_cloud_kpis(user_context=None)
+                stats["employees_total"] = cloud_stats.get("employees_total") or 0
+                stats["events_total"] = cloud_stats.get("events_total") or 0
+            except Exception as pg_error:
+                logger.warning("PostgreSQL extra KPIs skipped: %s", pg_error)
+        return jsonify({"success": True, "stats": stats}), 200
+    except Exception as inner_e:
+        return jsonify({"success": False, "error": str(inner_e)}), 500
 
 
 # ==============================================================================

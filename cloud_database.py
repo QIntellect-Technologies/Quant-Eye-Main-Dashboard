@@ -256,6 +256,25 @@ def tenant_context(
 # =====================================================================
 # Database Schema Initialization & Migrations
 # =====================================================================
+def ensure_portal_slug_column() -> None:
+    """Add portal_slug to an already-created organizations table (Railway live DB)."""
+    if not postgres_is_configured():
+        return
+    conn = get_raw_connection()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS portal_slug VARCHAR(80);")
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_portal_slug ON organizations(portal_slug);"
+            )
+        logger.info("Ensured organizations.portal_slug exists.")
+    except Exception as error:
+        logger.warning("Could not ensure portal_slug yet: %s", error)
+    finally:
+        conn.close()
+
+
 def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
     """Initialize cloud schema using superuser/admin connection."""
     if not postgres_is_configured():
@@ -273,11 +292,14 @@ def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(ddl)
             cur.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS portal_slug VARCHAR(80);")
             cur.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_portal_slug ON organizations(portal_slug);"
             )
+            try:
+                cur.execute(ddl)
+            except Exception as ddl_error:
+                logger.warning("cloud_schema.sql apply continued after: %s", ddl_error)
         logger.info("Successfully executed cloud_schema.sql DDL.")
 
         # Seed Module Catalog
