@@ -103,6 +103,9 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertEqual(page_res.status_code, 200)
         self.assertIn(b'<body class="auth-required">', page_res.data)
         self.assertIn(b'id="loginModal"', page_res.data)
+        self.assertIn(b'Admin email configured for this service', page_res.data)
+        self.assertNotIn(b'admin@qintellect.com</code>', page_res.data)
+        self.assertNotIn(b'admin@forknknives.com</code>', page_res.data)
 
         protected_res = self.client.get("/api/organizations")
         self.assertEqual(protected_res.status_code, 401)
