@@ -138,6 +138,46 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertEqual(response.get_json()["cameras"], load_cameras.return_value)
         load_cameras.assert_called_once_with("ORG-001", "BR-01")
 
+    @patch("app.query_local_dashboard")
+    @patch("app.db.get_branch_by_token_key")
+    def test_branch_employee_endpoint_relays_scoped_portal_profiles(self, get_branch_by_token_key, relay):
+        get_branch_by_token_key.return_value = {
+            "branch_id": "BR-01",
+            "organization_id": "ORG-001",
+            "organization_status": "Active",
+            "branch_access": "Active",
+        }
+        relay.return_value = {
+            "ok": True,
+            "status_code": 200,
+            "data": {
+                "success": True,
+                "organization_id": "ORG-001",
+                "branch_id": "BR-01",
+                "employees": [{"id": 17, "name": "New Employee"}],
+            },
+        }
+
+        denied = self.client.get("/api/branches/BR-01/employees")
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.get(
+            "/api/branches/BR-01/employees",
+            headers={"X-Branch-Key": "QE-TEST-KEY"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["employees"], [{"id": 17, "name": "New Employee"}])
+        relay.assert_called_once_with(
+            "/api/integration/employees?organization_id=ORG-001&branch_id=BR-01"
+        )
+
+        relay.return_value = {"ok": False, "status_code": 503}
+        unavailable = self.client.get(
+            "/api/branches/BR-01/employees",
+            headers={"X-Branch-Key": "QE-TEST-KEY"},
+        )
+        self.assertEqual(unavailable.status_code, 503)
+
     def test_02_protected_routes_require_a_valid_session(self):
         """Unauthenticated requests and stale session IDs must not acquire admin access."""
         with self.client.session_transaction() as session:

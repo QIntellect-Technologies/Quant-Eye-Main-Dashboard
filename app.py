@@ -945,6 +945,7 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
         "/api/integration/sync",
         "/api/integration/edge-sync-state",
         "/api/integration/cameras",
+        "/api/integration/employees",
         "/api/attendance/edge-mark",
     }:
         integration_key = os.environ.get("LOCAL_DASHBOARD_API_KEY", "").strip()
@@ -1118,79 +1119,57 @@ def sync_to_local_dashboard():
 @app.get("/api/branches/<branch_id>/employees")
 def get_employees_for_branch(branch_id):
     """Fetch cloud-registered employees for a specific branch for Client Node synchronization."""
-    org_id = request.args.get("organization_id")
-    try:
+    branch_key = request.headers.get("X-Branch-Key", "").strip()
+    if branch_key:
+        branch_info = db.get_branch_by_token_key(branch_key)
+        if not branch_info or str(branch_info.get("branch_id")) != str(branch_id):
+            return jsonify({"success": False, "error": "Valid branch credentials are required."}), 401
+        if branch_info.get("organization_status") != "Active" or branch_info.get("branch_access") != "Active":
+            return jsonify({"success": False, "error": "Branch access is suspended or inactive."}), 403
+        org_id = str(branch_info["organization_id"])
+    else:
         user = get_current_user()
-        if user and user.get("role") == "organization_admin":
+        if not user:
+            return jsonify({"success": False, "error": "Branch credentials or dashboard authentication are required."}), 401
+        org_id = request.args.get("organization_id", "")
+        if user.get("role") == "organization_admin":
             org_id = user.get("organization_id")
-    except Exception:
-        pass
-    if not org_id:
-        org_id = "ORG-001"
+        elif user.get("role") != "platform_admin":
+            return jsonify({"success": False, "error": "Access forbidden."}), 403
+        organization = db.get_organization_by_id(org_id) if org_id else None
+        branches = organization.get("branches", []) if organization else []
+        if not any(str(branch.get("id")) == str(branch_id) for branch in branches):
+            return jsonify({"success": False, "error": "Branch was not found for this organization."}), 404
 
-    # 1. Try PostgreSQL
-    try:
-        import cloud_database as cloud_db
-        pg_emps = cloud_db.get_employees(org_id=org_id, branch_id=branch_id)
-        if pg_emps:
-            result = []
-            for e in pg_emps:
-                result.append({
-                    "id": str(e.get("id")),
-                    "name": e.get("name") or e.get("full_name", "Employee"),
-                    "employee_code": e.get("employee_code") or f"EMP-{e.get('id')}",
-                    "department": e.get("department") or "General",
-                    "position": e.get("designation") or e.get("position") or "",
-                    "organization_id": org_id,
-                    "branch_id": branch_id
-                })
-            return jsonify({
-                "success": True,
-                "organization_id": org_id,
-                "branch_id": branch_id,
-                "employees": result,
-                "count": len(result)
-            }), 200
-    except Exception as pe:
-        logger.warning("Could not query PostgreSQL employees: %s", pe)
+    portal_response = query_local_dashboard(
+        f"/api/integration/employees?organization_id={org_id}&branch_id={branch_id}"
+    )
+    if not portal_response.get("ok"):
+        logger.warning(
+            "Client Portal employee relay failed for branch %s (HTTP %s).",
+            branch_id,
+            portal_response.get("status_code"),
+        )
+        return jsonify({
+            "success": False,
+            "error": "Employee profiles are temporarily unavailable; cached branch profiles are preserved."
+        }), 503
 
-    # 2. Try SQLite database
-    try:
-        with db.get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT id, name, COALESCE(department, 'General'), COALESCE(position, ''), 
-                       COALESCE(notes, ''), COALESCE(employee_code, '')
-                FROM users 
-                WHERE (organization_id = ? AND branch_id = ?) 
-                   OR (organization_id IS NULL OR organization_id = ?)
-            """, (org_id, branch_id, org_id))
-            rows = cur.fetchall()
-            result = [{
-                "id": str(r[0]),
-                "name": r[1],
-                "department": r[2],
-                "position": r[3],
-                "employee_code": r[5] or r[4] or f"EMP-{r[0]}",
-                "organization_id": org_id,
-                "branch_id": branch_id
-            } for r in rows]
-            return jsonify({
-                "success": True,
-                "organization_id": org_id,
-                "branch_id": branch_id,
-                "employees": result,
-                "count": len(result)
-            }), 200
-    except Exception as se:
-        logger.warning("Could not query SQLite employees: %s", se)
-
+    portal_data = portal_response.get("data") or {}
+    if (
+        portal_data.get("success") is not True
+        or str(portal_data.get("organization_id")) != org_id
+        or str(portal_data.get("branch_id")) != str(branch_id)
+        or not isinstance(portal_data.get("employees"), list)
+    ):
+        return jsonify({"success": False, "error": "Client Portal returned an invalid employee response."}), 502
+    employees = portal_data["employees"]
     return jsonify({
         "success": True,
         "organization_id": org_id,
         "branch_id": branch_id,
-        "employees": [],
-        "count": 0
+        "employees": employees,
+        "count": len(employees),
     }), 200
 
 
