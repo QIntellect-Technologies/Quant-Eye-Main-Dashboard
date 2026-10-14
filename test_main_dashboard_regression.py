@@ -95,15 +95,15 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertIn("main_dashboard_url", data)
 
     def test_client_portal_link_redirects_to_configured_client_service(self):
-        with patch("app.DEFAULT_CLIENT_URL", "https://client.example.test/"):
-            response = self.client.get(
-                "/client/portal?organization_id=ORG-001&branch_id=BR-01"
-            )
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(
-            response.headers["Location"],
-            "https://client.example.test/?organization_id=ORG-001&branch_id=BR-01",
+        org = db.get_organization_by_id("ORG-001")
+        response = self.client.get(
+            "/client/portal?organization_id=ORG-001&branch_id=BR-01"
         )
+        self.assertEqual(response.status_code, 302)
+        location = response.headers["Location"]
+        self.assertIn("/c/", location)
+        self.assertIn(org["portal_slug"], location)
+        self.assertTrue(location.endswith("/"))
 
     def test_dashboard_uses_configured_client_portal_url(self):
         with patch("app.DEFAULT_CLIENT_URL", "https://client.example.test/"):
@@ -137,6 +137,32 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["cameras"], load_cameras.return_value)
         load_cameras.assert_called_once_with("ORG-001", "BR-01")
+
+    @patch("app.query_local_dashboard")
+    @patch("app.db.get_branch_by_token_key")
+    def test_edge_shifts_require_branch_key_and_relay_local(self, get_branch_by_token_key, relay):
+        denied = self.client.get("/api/edge/shifts")
+        self.assertEqual(denied.status_code, 401)
+        get_branch_by_token_key.return_value = {
+            "branch_id": "BR-01",
+            "organization_id": "ORG-001",
+            "organization_status": "Active",
+            "branch_access": "Active",
+        }
+        relay.return_value = {
+            "ok": True,
+            "status_code": 200,
+            "data": {
+                "success": True,
+                "organization_id": "ORG-001",
+                "branch_id": "BR-01",
+                "shifts": [{"id": 1, "name": "Day"}],
+            },
+        }
+        response = self.client.get("/api/edge/shifts", headers={"X-Branch-Key": "QE-TEST-KEY"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["shifts"][0]["name"], "Day")
+        self.assertIn("/api/integration/shifts?", relay.call_args.args[0])
 
     @patch("app.query_local_dashboard")
     @patch("app.db.get_branch_by_token_key")
@@ -479,6 +505,51 @@ class TestMainDashboardRegression(unittest.TestCase):
             "password": "admin123",
         })
         self.assertEqual(legacy_fallback_res.status_code, 401)
+
+    def test_client_authenticate_returns_live_org_modules_and_portal_url(self):
+        live_modules = ["attendance", "shifts", "payroll"]
+        org = db.create_organization({
+            "name": "Live Modules Org",
+            "modules": live_modules,
+            "branches": [{"id": "BR-LIVE-01", "name": "Live Branch"}],
+        })
+        build_password = "LiveModules-Build-Pass-2026"
+        db.create_build({
+            "id": "BUILD-LIVE-MODULES",
+            "organizationId": org["id"],
+            "organizationName": org["name"],
+            "branchId": org["branches"][0]["id"],
+            "branchName": org["branches"][0]["name"],
+            "clientUsername": "live-modules@example.test",
+            "clientPassword": build_password,
+            "modules": ["attendance"],
+        })
+        res = self.client.post("/api/client/authenticate", json={
+            "username": "live-modules@example.test",
+            "password": build_password,
+        })
+        self.assertEqual(res.status_code, 200)
+        payload = res.get_json()
+        self.assertEqual(sorted(payload["modules"]), sorted(live_modules))
+        self.assertEqual(payload["build_modules"], ["attendance"])
+        self.assertTrue(payload["client_portal_url"].endswith("/"))
+        self.assertNotIn("main-dashboard", payload["client_portal_url"])
+        self.assertIn("/c/", payload["client_portal_url"])
+        self.assertEqual(payload["portal_slug"], db.get_organization_by_id(org["id"])["portal_slug"])
+
+        wrong_slug = self.client.post("/api/client/authenticate", json={
+            "username": "live-modules@example.test",
+            "password": build_password,
+            "portal_slug": "someone-else-org",
+        })
+        self.assertEqual(wrong_slug.status_code, 403)
+
+    def test_handover_page_labels_portal_not_main(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"function resolveClientPortalUrl", response.data)
+        self.assertIn(b"not Main Dashboard", response.data)
+        self.assertIn(b"EXE BRANCH KEY", response.data)
 
     def test_attendance_relay_requires_branch_key_and_is_idempotent(self):
         organization = db.get_organization_by_id("ORG-001")

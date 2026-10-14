@@ -403,7 +403,33 @@
     function organizationInvoices(orgId){return invoices.filter(invoice=>invoice.organizationId===orgId&&invoice.status!=="Draft"&&invoice.status!=="Cancelled")}
     function organizationKeyDisplayState(org){const state=organizationKeyState(org);if(state!=="Valid")return state;if(!org.tokenExpiresAt)return state;const remaining=inclusiveDaysBetween(localDateValue(),org.tokenExpiresAt);return remaining<=30?`Expires in ${remaining} day${remaining===1?"":"s"}`:"Valid"}
     function effectiveBranchAccess(org,branch){if(org.status!=="Active")return "Organization inactive";const keyState=organizationKeyState(org);if(keyState==="Expired"||keyState==="Not active yet")return `Organization key ${keyState.toLowerCase()}`;if(branch.access==="Suspended")return "Suspended";return "Active"}
-    function clientPortalHref(org,branch){const portal=new URL(GLOBAL_CLIENT_URL,window.location.origin);portal.searchParams.set("organization_id",org.id);portal.searchParams.set("branch_id",branch.id);return portal.toString()}
+    function resolveClientPortalUrl(candidate){
+      const fallback = GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
+      try {
+        const url = new URL(candidate || fallback, window.location.origin);
+        const host = (url.hostname || "").toLowerCase();
+        if (host.includes("main-dashboard") || url.pathname.indexOf("/client/portal") === 0 || url.pathname.indexOf("/client-portal") === 0) {
+          return new URL(fallback, window.location.origin).toString();
+        }
+        return url.toString();
+      } catch (e) {
+        return fallback;
+      }
+    }
+    function clientPortalHref(org,branch){
+      const uniqueUrl = org.clientPortalUrl || org.client_portal_url;
+      if (uniqueUrl) return resolveClientPortalUrl(uniqueUrl);
+      const slug = org.portalSlug || org.portal_slug;
+      const portal=new URL(resolveClientPortalUrl(GLOBAL_CLIENT_URL),window.location.origin);
+      if (slug) {
+        portal.pathname = `/c/${slug}/`;
+        portal.search = "";
+        return portal.toString();
+      }
+      portal.searchParams.set("organization_id",org.id);
+      if (branch && branch.id) portal.searchParams.set("branch_id",branch.id);
+      return portal.toString();
+    }
     function createToken(){return "QE-"+crypto.randomUUID().replaceAll("-","").slice(0,20).toUpperCase()}
     function createBranchId(){return "BR-"+crypto.randomUUID().replaceAll("-","").slice(0,16).toUpperCase()}
     function createOrganizationKeyId(){return "ORGKEY-"+crypto.randomUUID().replaceAll("-","").slice(0,16).toUpperCase()}
@@ -756,7 +782,7 @@
       if(!org||org.status!=="Active"){notify("Choose an active organization before creating a branch build.",true);return}
       const defaultUser = org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`;
       const defaultPass = generateClientPassword();
-      const cloudUrl = GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
+      const cloudUrl = org.clientPortalUrl || org.client_portal_url || GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
 
       openModal(`
         <h2><i class="fa-solid fa-gears" style="color:#3d9fd4"></i> Create Branch Build & Generate Client Portal</h2>
@@ -935,59 +961,56 @@
       const org=organizations.find(item=>item.id===build.organizationId);
       const branch=org&&org.branches.find(b=>b.id===build.branchId);
       const branchKey = (branch&&branch.tokenKey)||(build&&build.branchKey)||(org&&org.tokenKey)||"QE-9A5DDEE7B01A41C18B2F";
-      const clientUrl = build.clientPortalUrl || GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
+      const clientUrl = resolveClientPortalUrl(build.clientPortalUrl || GLOBAL_CLIENT_URL);
       const defaultUser = build.clientUsername || (org ? (org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`) : "admin@client.com");
       const defaultPass = buildCredentials.get(build.id) || "";
 
-      const handoverText = `🚀 QINTELLECT CLIENT PORTAL & AI NODE CREDENTIALS
+      const handoverText = `QINTELLECT CLIENT HANDOVER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🏢 Organization: ${org?org.name:build.organizationName}
-🏬 Branch: ${build.branchName||"Main Branch"}
-📦 Application Version: ${build.version||"v1.0.1"}
+Organization: ${org?org.name:build.organizationName}
+Branch: ${build.branchName||"Main Branch"}
 
-🌐 Client Cloud Portal Link:
+1. CLIENT PORTAL URL (open in browser — not Main Dashboard):
 ${clientUrl}
 
-👤 Client Login Username / Email:
-${defaultUser}
+2. CLIENT PORTAL LOGIN (email + password for that URL only):
+Email: ${defaultUser}
+Password: ${defaultPass || "Not available in this browser session; create a replacement build to issue new credentials."}
 
-🔑 Client Login Password:
-${defaultPass || "Not available in this browser session; create a replacement build to issue new credentials."}
-
-📹 Standalone AI CCTV Branch Key:
+3. EXE BRANCH KEY (desktop AI node only — not a website login):
 ${branchKey}
 
-⚡ Purchased Modules:
-${(build.modules||[]).map(moduleName).join(", ")}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-© 2026 QIntellect Technologies`;
+Licensed modules (live on next portal login):
+${((org&&org.modules)||build.modules||[]).map(moduleName).join(", ")}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
       openModal(`
-        <h2><i class="fa-solid fa-rocket" style="color:#3d9fd4"></i> Client Application & Cloud Credentials</h2>
+        <h2><i class="fa-solid fa-rocket" style="color:#3d9fd4"></i> Client handover</h2>
         <p style="color:#475569; margin-top:-4px;"><strong>${esc(org?org.name:build.organizationName)}</strong> · ${esc(build.branchName||"Main Branch")}</p>
+        <p style="color:#64748b; font-size:0.85rem;">Give the client these three items only. Main Dashboard is for you, not for them.</p>
         
         <div class="build-detail-grid" style="margin-bottom:16px;">
           <div><small>Application Version</small><strong>${esc(build.version||"v1.0.1")}</strong></div>
           <div><small>Build Status</small><strong>${statusBadge(build.status)}</strong></div>
           <div>
-            <small>Branch Key (AI Node)</small>
+            <small>3. EXE branch key (desktop AI node only)</small>
             <div style="display:flex; align-items:center; gap:6px;">
               <strong class="mono" style="color:#3d9fd4;font-size:0.85rem;">${esc(branchKey)}</strong>
               <button type="button" class="btn-outline" style="padding:2px 6px; font-size:0.75rem;" onclick="copyToClipboard('${esc(branchKey)}', 'Branch Key')"><i class="fa-solid fa-copy"></i></button>
             </div>
           </div>
           <div>
-            <small>Client Cloud Portal Link</small>
+            <small>1. Client Portal URL (not Main Dashboard)</small>
             <div style="display:flex; align-items:center; gap:6px;">
-              <strong><a href="${clientUrl}" target="_blank" style="color:#0284c7;text-decoration:underline;">${clientUrl}</a></strong>
-              <button type="button" class="btn-outline" style="padding:2px 6px; font-size:0.75rem;" onclick="copyToClipboard('${clientUrl}', 'Cloud URL')"><i class="fa-solid fa-copy"></i></button>
+              <strong><a href="${clientUrl}" target="_blank" rel="noopener noreferrer" style="color:#0284c7;text-decoration:underline;">${clientUrl}</a></strong>
+              <button type="button" class="btn-outline" style="padding:2px 6px; font-size:0.75rem;" onclick="copyToClipboard('${clientUrl}', 'Client Portal URL')"><i class="fa-solid fa-copy"></i></button>
             </div>
           </div>
         </div>
 
         <div style="background:#f8fafc; border:1px solid #dbe5ec; border-radius:12px; padding:16px; margin-bottom:16px;">
           <h4 style="margin:0 0 10px; font-size:0.95rem; font-weight:800; color:#173042; display:flex; justify-content:space-between; align-items:center;">
-            <span><i class="fa-solid fa-key" style="color:#3d9fd4; margin-right:6px;"></i> Client Login Credentials</span>
+            <span><i class="fa-solid fa-key" style="color:#3d9fd4; margin-right:6px;"></i> 2. Client Portal login (that URL only)</span>
             <span style="font-size:0.75rem; background:#dcfce7; color:#166534; padding:2px 8px; border-radius:99px; font-weight:700;">Ready to send</span>
           </h4>
           
@@ -1016,7 +1039,7 @@ ${(build.modules||[]).map(moduleName).join(", ")}
         </div>
 
         <div class="summary" style="margin-bottom:16px;">
-          <i class="fa-solid fa-video" style="color:#0284c7; margin-right:4px;"></i> <strong>Standalone AI Edge Node:</strong> Give the <strong>Branch Key</strong> to the client's on-site IT team. They enter it in their desktop AI Attendance application to stream local CCTV cameras.
+          <i class="fa-solid fa-video" style="color:#0284c7; margin-right:4px;"></i> The branch key is for the EXE only. Do not open Main Dashboard as the client portal.
         </div>
 
         <div class="form-actions" style="margin-top:16px;">

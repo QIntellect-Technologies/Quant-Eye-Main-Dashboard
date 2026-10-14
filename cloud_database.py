@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Any, Tuple
+from urllib.parse import urlparse
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -26,49 +27,95 @@ if not logger.handlers:
 # =====================================================================
 # Configuration
 # =====================================================================
-PG_HOST = os.environ.get("PGHOST", "127.0.0.1")
-PG_PORT = int(os.environ.get("PGPORT", "5432"))
+PG_HOST = os.environ.get("PGHOST", "")
+PG_PORT = int(os.environ.get("PGPORT", "5432") or "5432")
 PG_DATABASE = os.environ.get("PGDATABASE", "quanteye_cloud")
 PG_USER = os.environ.get("PGUSER", "postgres")
 PG_PASSWORD = os.environ.get("PGPASSWORD", "")
+PG_CONNECT_TIMEOUT = int(os.environ.get("PGCONNECT_TIMEOUT", "5") or "5")
 
 # Application Runtime Role credentials
 APP_RUNTIME_ROLE = "app_runtime_role"
 
 _pool: Optional[pool.ThreadedConnectionPool] = None
+_LOCAL_PG_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _production_runtime() -> bool:
+    return bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("APP_ENV", "").lower() == "production"
+        or os.environ.get("FLASK_ENV", "").lower() == "production"
+    )
+
+
+def _hostname_from_database_url(db_url: str) -> str:
+    try:
+        return (urlparse(db_url).hostname or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def postgres_is_configured() -> bool:
+    """True only when a real Postgres target is set. Localhost is not production."""
+    db_url = (os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or "").strip()
+    if db_url:
+        host = _hostname_from_database_url(db_url)
+        if _production_runtime() and host in _LOCAL_PG_HOSTS:
+            return False
+        return True
+    host = (os.environ.get("PGHOST") or "").strip()
+    if not host:
+        return False
+    if _production_runtime() and host.lower() in _LOCAL_PG_HOSTS:
+        return False
+    return True
+
 
 def get_connection_params(user: Optional[str] = None, password: Optional[str] = None) -> Dict[str, Any]:
     # Check if DATABASE_URL or POSTGRES_URL is provided (standard on Railway, Render, etc.)
     db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
     if db_url and not user and not password:
-        return {"dsn": db_url}
+        return {"dsn": db_url, "connect_timeout": PG_CONNECT_TIMEOUT}
 
+    host = (os.environ.get("PGHOST") or PG_HOST or "").strip() or "127.0.0.1"
     params = {
-        "host": PG_HOST,
+        "host": host,
         "port": PG_PORT,
         "dbname": PG_DATABASE,
         "user": user or PG_USER,
         "password": password or PG_PASSWORD,
+        "connect_timeout": PG_CONNECT_TIMEOUT,
     }
     return params
 
 def get_raw_connection(user: Optional[str] = None, password: Optional[str] = None):
+    if not postgres_is_configured() and not (user or password):
+        raise RuntimeError("PostgreSQL is not configured. Set DATABASE_URL or PGHOST.")
     params = get_connection_params(user, password)
+    connect_timeout = params.pop("connect_timeout", PG_CONNECT_TIMEOUT)
     if "dsn" in params:
-        return psycopg2.connect(params["dsn"])
-    return psycopg2.connect(**params)
+        return psycopg2.connect(params["dsn"], connect_timeout=connect_timeout)
+    return psycopg2.connect(connect_timeout=connect_timeout, **params)
 
 def init_cloud_pool(minconn: int = 1, maxconn: int = 20) -> pool.ThreadedConnectionPool:
     global _pool
+    if not postgres_is_configured():
+        raise RuntimeError("PostgreSQL is not configured. Set DATABASE_URL on Railway.")
     if _pool is None:
         params = get_connection_params()
         try:
+            connect_timeout = params.pop("connect_timeout", PG_CONNECT_TIMEOUT)
             if "dsn" in params:
-                _pool = pool.ThreadedConnectionPool(minconn, maxconn, dsn=params["dsn"])
+                _pool = pool.ThreadedConnectionPool(
+                    minconn, maxconn, dsn=params["dsn"], connect_timeout=connect_timeout
+                )
                 logger.info("Initialized PostgreSQL connection pool using DSN/DATABASE_URL")
             else:
-                _pool = pool.ThreadedConnectionPool(minconn, maxconn, **params)
-                logger.info("Initialized PostgreSQL connection pool (%s:%s/%s)", PG_HOST, PG_PORT, PG_DATABASE)
+                _pool = pool.ThreadedConnectionPool(
+                    minconn, maxconn, connect_timeout=connect_timeout, **params
+                )
+                logger.info("Initialized PostgreSQL connection pool (%s:%s/%s)", params.get("host"), PG_PORT, PG_DATABASE)
         except Exception as e:
             logger.warning("Could not initialize PostgreSQL connection pool: %s", e)
             raise
@@ -211,6 +258,8 @@ def tenant_context(
 # =====================================================================
 def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
     """Initialize cloud schema using superuser/admin connection."""
+    if not postgres_is_configured():
+        raise RuntimeError("PostgreSQL is not configured. Set DATABASE_URL on Railway.")
     if not schema_sql_path:
         schema_sql_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloud_schema.sql")
 
@@ -225,6 +274,10 @@ def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(ddl)
+            cur.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS portal_slug VARCHAR(80);")
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_portal_slug ON organizations(portal_slug);"
+            )
         logger.info("Successfully executed cloud_schema.sql DDL.")
 
         # Seed Module Catalog
@@ -351,16 +404,20 @@ def create_organization(
     phone: str = "",
     address: str = "",
     status: str = "Active",
+    portal_slug: Optional[str] = None,
     user_context: Optional[CloudUser] = None
 ) -> Dict[str, Any]:
+    from tenant_urls import make_portal_slug
     # Creating an organization is typically platform_admin or onboarding
     is_plat = user_context.is_platform_admin if user_context else True
-    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=is_plat) as cur:
+    slug = portal_slug or make_portal_slug(name, org_id)
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=is_plat, enforce_rls=False) as cur:
         cur.execute("""
-            INSERT INTO organizations (id, name, industry, email, phone, address, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO organizations (id, name, portal_slug, industry, email, phone, address, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
+                portal_slug = EXCLUDED.portal_slug,
                 industry = EXCLUDED.industry,
                 email = EXCLUDED.email,
                 phone = EXCLUDED.phone,
@@ -368,20 +425,57 @@ def create_organization(
                 status = EXCLUDED.status,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *;
-        """, (org_id, name, industry, email, phone, address, status))
+        """, (org_id, name, slug, industry, email, phone, address, status))
         row = cur.fetchone()
         return dict(row)
 
 def get_organization(org_id: str, user_context: Optional[CloudUser] = None) -> Optional[Dict[str, Any]]:
-    with tenant_context(user=user_context, org_id=org_id) as cur:
+    is_plat = user_context.is_platform_admin if user_context else True
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=is_plat, enforce_rls=bool(user_context)) as cur:
         cur.execute("SELECT * FROM organizations WHERE id = %s;", (org_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
+def get_organization_by_portal_slug(portal_slug: str) -> Optional[Dict[str, Any]]:
+    slug = str(portal_slug or "").strip().lower()
+    if not slug:
+        return None
+    with tenant_context(is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute("SELECT * FROM organizations WHERE LOWER(portal_slug) = %s;", (slug,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
 def list_organizations(user_context: Optional[CloudUser] = None) -> List[Dict[str, Any]]:
-    with tenant_context(user=user_context) as cur:
+    is_plat = user_context.is_platform_admin if user_context else True
+    with tenant_context(user=user_context, is_platform_admin=is_plat, enforce_rls=bool(user_context)) as cur:
         cur.execute("SELECT * FROM organizations ORDER BY name ASC;")
         return [dict(r) for r in cur.fetchall()]
+
+def get_branch_by_token_key(token_key: str) -> Optional[Dict[str, Any]]:
+    clean_key = str(token_key or "").strip()
+    if not clean_key:
+        return None
+    with tenant_context(is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute(
+            """
+            SELECT
+                b.id AS branch_id,
+                b.name AS branch_name,
+                b.organization_id,
+                o.name AS organization_name,
+                b.access AS branch_access,
+                b.token_key,
+                b.token_expires_at,
+                o.status AS organization_status,
+                o.portal_slug
+            FROM branches b
+            JOIN organizations o ON b.organization_id = o.id
+            WHERE LOWER(TRIM(b.token_key)) = LOWER(%s)
+            """,
+            (clean_key,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 def delete_organization(org_id: str, user_context: Optional[CloudUser] = None) -> bool:
     """Permanently delete an organization and all cascading data from PostgreSQL."""
@@ -432,7 +526,7 @@ def get_branch(org_id: str, branch_id: str, user_context: Optional[CloudUser] = 
         return dict(row) if row else None
 
 def list_branches(org_id: str, user_context: Optional[CloudUser] = None) -> List[Dict[str, Any]]:
-    with tenant_context(user=user_context, org_id=org_id) as cur:
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=not bool(user_context), enforce_rls=bool(user_context)) as cur:
         cur.execute("SELECT * FROM branches WHERE organization_id = %s ORDER BY name ASC;", (org_id,))
         return [dict(r) for r in cur.fetchall()]
 
@@ -443,7 +537,7 @@ def list_module_catalog(user_context: Optional[CloudUser] = None) -> List[Dict[s
         return [dict(r) for r in cur.fetchall()]
 
 def get_organization_modules(org_id: str, user_context: Optional[CloudUser] = None) -> List[Dict[str, Any]]:
-    with tenant_context(user=user_context, org_id=org_id) as cur:
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=not bool(user_context), enforce_rls=bool(user_context)) as cur:
         cur.execute("""
             SELECT om.module_id, om.is_enabled, mc.name, mc.description, mc.category
             FROM organization_modules om
@@ -505,7 +599,7 @@ def create_organization_license(
         return dict(row)
 
 def get_organization_licenses(org_id: str, user_context: Optional[CloudUser] = None) -> List[Dict[str, Any]]:
-    with tenant_context(user=user_context, org_id=org_id) as cur:
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=not bool(user_context), enforce_rls=bool(user_context)) as cur:
         cur.execute("SELECT * FROM organization_licenses WHERE organization_id = %s;", (org_id,))
         return [dict(r) for r in cur.fetchall()]
 
@@ -536,7 +630,7 @@ def set_organization_branding(
         return dict(row)
 
 def get_organization_branding(org_id: str, user_context: Optional[CloudUser] = None) -> Optional[Dict[str, Any]]:
-    with tenant_context(user=user_context, org_id=org_id) as cur:
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=not bool(user_context), enforce_rls=bool(user_context)) as cur:
         cur.execute("SELECT * FROM organization_branding WHERE organization_id = %s;", (org_id,))
         row = cur.fetchone()
         return dict(row) if row else None

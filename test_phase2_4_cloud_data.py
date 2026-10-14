@@ -182,7 +182,7 @@ class TestPhase24CloudData(unittest.TestCase):
         """2. Existing Staff Directory loads real employee fields."""
         # A. Portal route returns 200
         resp = self.client.get('/client/portal')
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 302)
 
         # B. Real Cloud Staff API returns real employee records
         api_resp = self.client.get(f'/api/cloud/staff?organization_id={self.org1_id}&branch_id={self.branch1_id}')

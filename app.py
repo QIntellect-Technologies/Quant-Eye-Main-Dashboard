@@ -9,6 +9,7 @@ import threading
 from functools import wraps
 from datetime import datetime
 from urllib.parse import urlencode, urlsplit
+from tenant_urls import company_portal_url, make_portal_slug
 from typing import Any, Dict
 from werkzeug.security import check_password_hash
 from jinja2 import ChoiceLoader, FileSystemLoader, PrefixLoader
@@ -21,6 +22,19 @@ try:
 except Exception as _cdb_err:
     cloud_db = None
     logger.warning("Cloud PostgreSQL module not loaded: %s", _cdb_err)
+
+
+def _postgres_ready() -> bool:
+    return cloud_db is not None and cloud_db.postgres_is_configured()
+
+
+def _postgres_replica_unavailable():
+    if _postgres_ready():
+        return None
+    return jsonify({
+        "success": False,
+        "error": "PostgreSQL replica is not configured. Set DATABASE_URL on Railway.",
+    }), 503
 
 app = Flask(__name__)
 _production_runtime = (
@@ -89,8 +103,8 @@ def _persist_attendance_event_to_postgres(
     organization_id: str,
     branch_id: str,
 ) -> None:
-    if cloud_db is None:
-        raise RuntimeError("PostgreSQL persistence module is unavailable.")
+    if not _postgres_ready():
+        raise RuntimeError("PostgreSQL is not configured. Set DATABASE_URL.")
     with cloud_db.tenant_context(
         org_id=organization_id,
         branch_id=branch_id,
@@ -139,6 +153,10 @@ def _persist_attendance_event_to_postgres(
 def _postgres_attendance_sync_worker() -> None:
     while True:
         try:
+            if not _postgres_ready():
+                _postgres_sync_wakeup.wait(timeout=30)
+                _postgres_sync_wakeup.clear()
+                continue
             pending_rows = db.get_due_attendance_postgres_sync()
             if not pending_rows:
                 _postgres_sync_wakeup.wait(timeout=5)
@@ -169,6 +187,8 @@ def _postgres_attendance_sync_worker() -> None:
 
 def _ensure_postgres_attendance_sync_worker() -> None:
     global _postgres_sync_worker_started
+    if not _postgres_ready():
+        return
     with _postgres_sync_worker_lock:
         if not _postgres_sync_worker_started:
             threading.Thread(
@@ -313,8 +333,11 @@ def cloud_edge_auth():
     if not node_id or not secret:
         return jsonify({"success": False, "error": "Missing edge_node_id or secret"}), 400
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     try:
-        import cloud_database as cloud_db
         auth_res = cloud_db.authenticate_edge_node(node_id, secret)
         if not auth_res:
             return jsonify({"success": False, "error": "Invalid edge credentials or edge node inactive/revoked"}), 401
@@ -334,8 +357,11 @@ def cloud_sync_batch():
 
     token = auth_header.split(" ", 1)[1].strip()
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     try:
-        import cloud_database as cloud_db
         node_auth = cloud_db.verify_edge_token(token)
         if not node_auth:
             return jsonify({"success": False, "error": "Unauthorized: invalid, expired, or revoked edge token"}), 401
@@ -371,8 +397,11 @@ def cloud_edge_config():
 
     token = auth_header.split(" ", 1)[1].strip()
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     try:
-        import cloud_database as cloud_db
         node_auth = cloud_db.verify_edge_token(token)
         if not node_auth:
             return jsonify({"success": False, "error": "Unauthorized: invalid, expired, or revoked edge token"}), 401
@@ -395,8 +424,11 @@ def cloud_edge_heartbeat():
 
     token = auth_header.split(" ", 1)[1].strip()
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     try:
-        import cloud_database as cloud_db
         node_auth = cloud_db.verify_edge_token(token)
         if not node_auth:
             return jsonify({"success": False, "error": "Unauthorized: invalid, expired, or revoked edge token"}), 401
@@ -444,15 +476,15 @@ def attendance_report_page():
 @app.get("/client-portal")
 def client_portal_page():
     """Send client portal visitors to the configured portal with their requested tenant context."""
-    tenant_context = {}
-    for key in ("organization_id", "branch_id"):
-        value = request.args.get(key, "").strip()
-        if value:
-            tenant_context[key] = value
-    portal_url = f"{DEFAULT_CLIENT_URL.rstrip('/')}/"
-    if tenant_context:
-        portal_url = f"{portal_url}?{urlencode(tenant_context)}"
-    return redirect(portal_url, code=302)
+    org_id = request.args.get("organization_id", "").strip()
+    if org_id:
+        organization = db.get_organization_by_id(org_id)
+        if organization:
+            return redirect(organization.get("clientPortalUrl") or company_portal_url(
+                organization.get("name") or "", org_id, organization.get("portal_slug")
+            ), code=302)
+        return redirect(company_portal_url("", org_id), code=302)
+    return redirect(f"{DEFAULT_CLIENT_URL.rstrip('/')}/", code=302)
 
 
 @app.get("/api/dashboard/stats")
@@ -460,6 +492,8 @@ def api_dashboard_stats():
     """Return real system KPIs derived directly from PostgreSQL, falling back safely to SQLite control plane stats."""
     try:
         user = get_current_user()
+        if not _postgres_ready():
+            raise RuntimeError("PostgreSQL replica is not configured")
         stats = cloud_db.get_cloud_kpis(user_context=None)
         return jsonify({
             "success": True,
@@ -581,13 +615,13 @@ def delete_organization(org_id):
         success = db.delete_organization(org_id)
 
         # Delete from PostgreSQL cloud DB (prevents orgs from reappearing after restart)
-        if cloud_db is not None:
+        if _postgres_ready():
             try:
                 cloud_db.delete_organization(org_id)
             except Exception as ce:
                 logger.warning(f"cloud_db.delete_organization failed for {org_id}: {ce}")
 
-        if not success and cloud_db is None:
+        if not success and not _postgres_ready():
             return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
 
         # Also purge organization's data from Client Portal (Local Dashboard)
@@ -936,7 +970,7 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
     try:
         local_base_url = _validate_service_url(LOCAL_DASHBOARD_URL, "LOCAL_DASHBOARD_URL")
     except ValueError as error:
-        return {"ok": False, "status_code": 503, "error": str(error)}
+        return {"ok": False, "status_code": 503, "hop": "local", "error": str(error)}
     url = f"{local_base_url}{endpoint}"
     data = None
     headers = {"Content-Type": "application/json"}
@@ -946,6 +980,7 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
         "/api/integration/edge-sync-state",
         "/api/integration/cameras",
         "/api/integration/employees",
+        "/api/integration/shifts",
         "/api/attendance/edge-mark",
     } or endpoint_path.startswith("/api/integration/employees/"):
         integration_key = os.environ.get("LOCAL_DASHBOARD_API_KEY", "").strip()
@@ -977,6 +1012,7 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
         return {
             "ok": False,
             "status_code": e.code,
+            "hop": "local",
             "error": f"HTTP Error {e.code}: {e.reason}",
             "details": error_body
         }
@@ -984,6 +1020,7 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
         return {
             "ok": False,
             "status_code": None,
+            "hop": "local",
             "error": f"Connection failed: {str(e)}"
         }
 
@@ -1152,7 +1189,8 @@ def get_employees_for_branch(branch_id):
         )
         return jsonify({
             "success": False,
-            "error": "Employee profiles are temporarily unavailable; cached branch profiles are preserved."
+            "error": "Employee profiles are temporarily unavailable; cached branch profiles are preserved.",
+            "failed_hop": portal_response.get("hop") or "local",
         }), 503
 
     portal_data = portal_response.get("data") or {}
@@ -1212,7 +1250,7 @@ def _load_branch_cameras(org_id, branch_id):
                 db.set_branch_cameras(org_id, branch_id, cameras)
             except Exception:
                 logger.exception("Could not refresh local branch camera cache.")
-            if cloud_db is not None:
+            if _postgres_ready():
                 try:
                     cloud_db.set_cloud_cameras(org_id, branch_id, cameras)
                 except Exception as error:
@@ -1226,7 +1264,7 @@ def _load_branch_cameras(org_id, branch_id):
             portal_result.get("error"),
         )
 
-    if cloud_db is not None:
+    if _postgres_ready():
         try:
             return _normalize_branch_cameras(cloud_db.get_cloud_cameras(org_id, branch_id))
         except Exception as error:
@@ -1263,7 +1301,11 @@ def get_cameras_for_branch(branch_id):
 
     cameras = _load_branch_cameras(org_id, branch_id)
     if cameras is None:
-        return jsonify({"success": False, "error": "Branch camera configuration is temporarily unavailable."}), 503
+        return jsonify({
+            "success": False,
+            "error": "Branch camera configuration is temporarily unavailable.",
+            "failed_hop": "local",
+        }), 503
     return jsonify({
         "success": True,
         "organization_id": org_id,
@@ -1287,13 +1329,13 @@ def update_cameras_for_branch(branch_id):
 
     cameras = payload.get("cameras", [])
 
-    # 1. Update in PostgreSQL and increment config_version
+    # 1. Update in PostgreSQL and increment config_version when the replica is configured
     new_version = 1
-    try:
-        import cloud_database as cloud_db
-        new_version = cloud_db.set_cloud_cameras(org_id, branch_id, cameras)
-    except Exception as e:
-        logger.warning("Could not persist cameras to PostgreSQL: %s", e)
+    if _postgres_ready():
+        try:
+            new_version = cloud_db.set_cloud_cameras(org_id, branch_id, cameras)
+        except Exception as e:
+            logger.warning("Could not persist cameras to PostgreSQL: %s", e)
 
     # 2. Keep local SQLite mirror synchronized
     try:
@@ -1400,33 +1442,35 @@ def ingest_attendance_event():
             "error": "event_id was already used with a different payload",
         }), 409
 
-    postgres_sync_status = "synced"
-    try:
-        _persist_attendance_event_to_postgres(
-            event_payload, source_event_id, org_id, branch_id
-        )
-    except Exception as pg_error:
+    postgres_sync_status = "skipped"
+    if _postgres_ready():
         try:
-            db.enqueue_attendance_postgres_sync(
-                source_event_id, org_id, branch_id, event_payload
+            _persist_attendance_event_to_postgres(
+                event_payload, source_event_id, org_id, branch_id
             )
-            _ensure_postgres_attendance_sync_worker()
-            postgres_sync_status = "pending"
-            logger.warning(
-                "PostgreSQL attendance replica for event %s is queued for retry: %s",
-                source_event_id,
-                pg_error,
-            )
-        except Exception:
-            logger.exception(
-                "PostgreSQL attendance sync queue could not persist event %s.",
-                source_event_id,
-            )
-            return jsonify({
-                "success": False,
-                "event_id": source_event_id,
-                "error": "Attendance was recorded locally, but cloud persistence could not be queued.",
-            }), 503
+            postgres_sync_status = "synced"
+        except Exception as pg_error:
+            try:
+                db.enqueue_attendance_postgres_sync(
+                    source_event_id, org_id, branch_id, event_payload
+                )
+                _ensure_postgres_attendance_sync_worker()
+                postgres_sync_status = "pending"
+                logger.warning(
+                    "PostgreSQL attendance replica for event %s is queued for retry: %s",
+                    source_event_id,
+                    pg_error,
+                )
+            except Exception:
+                logger.exception(
+                    "PostgreSQL attendance sync queue could not persist event %s.",
+                    source_event_id,
+                )
+                return jsonify({
+                    "success": False,
+                    "event_id": source_event_id,
+                    "error": "Attendance was recorded locally, but cloud persistence could not be queued.",
+                }), 503
 
     return jsonify({
         "success": True,
@@ -1479,6 +1523,7 @@ def get_edge_sync_state():
         return jsonify({
             "success": False,
             "error": "Attendance state is temporarily unavailable",
+            "failed_hop": local_result.get("hop") or "local",
         }), 502
 
     local_state = local_result.get("data") or {}
@@ -1498,6 +1543,50 @@ def get_edge_sync_state():
         "date": local_state.get("date"),
         "manual_absent_user_ids": local_state["manual_absent_user_ids"],
         "synced_at": datetime.now().isoformat(),
+    }), 200
+
+
+@app.get("/api/edge/shifts")
+def get_edge_shifts():
+    """Relay branch shifts to the EXE using the branch key only."""
+    branch_key = request.headers.get("X-Branch-Key", "").strip()
+    if not branch_key:
+        return jsonify({"success": False, "error": "Branch authentication required", "failed_hop": "main"}), 401
+    branch_info = db.get_branch_by_token_key(branch_key)
+    if not branch_info:
+        return jsonify({"success": False, "error": "Invalid branch credential", "failed_hop": "main"}), 401
+    if (
+        branch_info.get("organization_status") != "Active"
+        or branch_info.get("branch_access") != "Active"
+    ):
+        return jsonify({"success": False, "error": "Organization or branch is inactive", "failed_hop": "main"}), 403
+
+    organization_id = str(branch_info["organization_id"])
+    branch_id = str(branch_info["branch_id"])
+    local_result = query_local_dashboard(
+        f"/api/integration/shifts?organization_id={organization_id}&branch_id={branch_id}",
+        method="GET",
+    )
+    if not local_result.get("ok"):
+        return jsonify({
+            "success": False,
+            "error": "Shifts are temporarily unavailable",
+            "failed_hop": local_result.get("hop") or "local",
+        }), 502
+    local_data = local_result.get("data") or {}
+    if (
+        local_data.get("success") is not True
+        or str(local_data.get("organization_id")) != organization_id
+        or str(local_data.get("branch_id")) != branch_id
+        or not isinstance(local_data.get("shifts"), list)
+    ):
+        return jsonify({"success": False, "error": "Shift binding is invalid", "failed_hop": "local"}), 502
+    return jsonify({
+        "success": True,
+        "organization_id": organization_id,
+        "branch_id": branch_id,
+        "shifts": local_data["shifts"],
+        "count": len(local_data["shifts"]),
     }), 200
 
 
@@ -1638,6 +1727,9 @@ def api_cloud_reports_attendance():
     ok, err = check_org_permission(org_id)
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
 
     if not cloud_db.check_module_entitlement(org_id, "attendance"):
         return jsonify({"success": False, "error": "Module 'attendance' is not licensed for this organization."}), 403
@@ -1678,6 +1770,9 @@ def api_cloud_staff_list():
     ok, err = check_org_permission(org_id)
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
 
     branch_id = request.args.get("branch_id") or None
     search = request.args.get("search", "").strip() or None
@@ -1706,6 +1801,10 @@ def api_cloud_leaves_list():
     ok, err = check_org_permission(org_id)
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
+
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
 
     if not cloud_db.check_module_entitlement(org_id, "leave"):
         return jsonify({"success": False, "error": "Module 'leave' is not licensed for this organization."}), 403
@@ -1736,6 +1835,10 @@ def api_cloud_overtime_list():
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     if not cloud_db.check_module_entitlement(org_id, "overtime"):
         return jsonify({"success": False, "error": "Module 'overtime' is not licensed for this organization."}), 403
 
@@ -1765,6 +1868,10 @@ def api_cloud_shifts_list():
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     if not cloud_db.check_module_entitlement(org_id, "shifts"):
         return jsonify({"success": False, "error": "Module 'shifts' is not licensed for this organization."}), 403
 
@@ -1791,6 +1898,10 @@ def api_cloud_payroll_runs():
     ok, err = check_org_permission(org_id)
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
+
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
 
     if not cloud_db.check_module_entitlement(org_id, "payroll"):
         return jsonify({"success": False, "error": "Module 'payroll' is not licensed for this organization."}), 403
@@ -1819,6 +1930,10 @@ def api_cloud_payroll_records(run_id):
     if not ok:
         return jsonify({"success": False, "error": err[0]}), err[1]
 
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
+
     if not cloud_db.check_module_entitlement(org_id, "payroll"):
         return jsonify({"success": False, "error": "Module 'payroll' is not licensed for this organization."}), 403
 
@@ -1842,6 +1957,10 @@ def api_cloud_stats():
         org_id = user.get("organization_id")
     elif not org_id:
         org_id = "ORG-257281"
+
+    replica_error = _postgres_replica_unavailable()
+    if replica_error:
+        return replica_error
 
     employees = cloud_db.get_cloud_staff_list(org_id=org_id)
     return jsonify({
@@ -1929,6 +2048,7 @@ def client_authenticate():
     ident = str(data.get("username") or data.get("email") or "").strip().lower()
     password = data.get("password") or ""
     branch_key = str(data.get("branch_key") or "").strip().upper()
+    requested_slug = str(data.get("portal_slug") or data.get("company_slug") or "").strip().lower()
     if not isinstance(password, str):
         return jsonify({"success": False, "error": "Password must be a string."}), 400
 
@@ -1998,21 +2118,29 @@ def client_authenticate():
     branch_name = matched_branch.get("name") if matched_branch else "Main Branch"
     branch_id = matched_branch.get("id") if matched_branch else "BR-01"
     b_key = (matched_branch.get("tokenKey") or matched_branch.get("token_key") or matched_org.get("tokenKey") or "") if matched_branch else (matched_org.get("tokenKey") or "")
-    modules = (
-        authenticated_build.get("modules", [])
-        if authenticated_build
-        else matched_org.get("modules", [])
+    live_modules = matched_org.get("modules") or []
+    if not isinstance(live_modules, list) or not live_modules:
+        live_modules = ["attendance"]
+    build_modules = authenticated_build.get("modules") if authenticated_build else []
+    portal_slug = matched_org.get("portal_slug") or make_portal_slug(matched_org.get("name") or "", matched_org["id"])
+    if requested_slug and requested_slug != str(portal_slug).lower():
+        return jsonify({"success": False, "error": "These credentials do not belong to this company portal."}), 403
+    portal_url = matched_org.get("clientPortalUrl") or company_portal_url(
+        matched_org.get("name") or "", matched_org["id"], portal_slug
     )
 
     return jsonify({
         "success": True,
         "organization_id": matched_org["id"],
         "organization_name": matched_org["name"],
+        "portal_slug": portal_slug,
         "branch_id": branch_id,
         "branch_name": branch_name,
         "branch_key": b_key,
         "username": ident or matched_org.get("email", ""),
-        "modules": modules,
+        "modules": live_modules,
+        "build_modules": build_modules if isinstance(build_modules, list) else [],
+        "client_portal_url": portal_url,
         "token_expires_at": matched_branch.get("tokenExpiresAt") if matched_branch else None
     }), 200
 

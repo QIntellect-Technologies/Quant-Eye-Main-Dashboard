@@ -8,6 +8,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
 from werkzeug.security import check_password_hash, generate_password_hash
+from tenant_urls import company_portal_url, make_portal_slug
 
 logger = logging.getLogger("quanteye.main_db")
 
@@ -58,6 +59,7 @@ def init_db() -> bool:
                 phone TEXT,
                 address TEXT,
                 status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active', 'Build Pending', 'Inactive', 'Suspended')),
+                portal_slug TEXT UNIQUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -458,13 +460,25 @@ def init_db() -> bool:
         # This prevents deleted organizations from reappearing after a server restart.
 
         _migrate_build_manifest_credentials(cursor)
+        try:
+            cursor.execute("ALTER TABLE organizations ADD COLUMN portal_slug TEXT")
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute("SELECT id, name, portal_slug FROM organizations")
+        for row in cursor.fetchall():
+            if row["portal_slug"]:
+                continue
+            slug = make_portal_slug(row["name"], row["id"])
+            cursor.execute("UPDATE organizations SET portal_slug = ? WHERE id = ?", (slug, row["id"]))
         conn.commit()
 
-    if _HAS_CLOUD_DB:
+    if _HAS_CLOUD_DB and cloud_db.postgres_is_configured():
         try:
             cloud_db.init_cloud_db()
         except Exception as e:
             logger.warning("cloud_db init failed during init_db: %s", e)
+    elif _HAS_CLOUD_DB:
+        logger.info("PostgreSQL is not configured; SQLite remains the control-plane store.")
 
     return True
 
@@ -473,8 +487,73 @@ def init_db() -> bool:
 # ORGANIZATIONS & BRANCHES CRUD HELPERS
 # ==============================================================================
 
+def _postgres_control_plane_ready() -> bool:
+    return bool(_HAS_CLOUD_DB and cloud_db is not None and cloud_db.postgres_is_configured())
+
+
+def _decorate_organization_urls(org_dict: Dict[str, Any]) -> Dict[str, Any]:
+    org_id = str(org_dict.get("id") or "")
+    name = str(org_dict.get("name") or "")
+    slug = str(org_dict.get("portal_slug") or org_dict.get("portalSlug") or "").strip() or make_portal_slug(name, org_id)
+    org_dict["portal_slug"] = slug
+    org_dict["portalSlug"] = slug
+    org_dict["clientPortalUrl"] = company_portal_url(name, org_id, slug)
+    org_dict["client_portal_url"] = org_dict["clientPortalUrl"]
+    return org_dict
+
+
+def _organization_from_postgres(org_id: str) -> Optional[Dict[str, Any]]:
+    if not _postgres_control_plane_ready():
+        return None
+    try:
+        row = cloud_db.get_organization(org_id, user_context=None)
+        if not row:
+            return None
+        org_dict = dict(row)
+        modules = cloud_db.get_organization_modules(org_id, user_context=None) or []
+        org_dict["modules"] = [m.get("module_id") for m in modules if m.get("is_enabled")]
+        branches = []
+        for branch in cloud_db.list_branches(org_id, user_context=None) or []:
+            b_dict = dict(branch)
+            b_dict["graceDays"] = b_dict.get("grace_days", 0)
+            b_dict["employeeCount"] = b_dict.get("employee_count", 0)
+            b_dict["tokenKey"] = b_dict.get("token_key") or ""
+            b_dict["tokenExpiresAt"] = b_dict.get("token_expires_at") or ""
+            b_dict["access"] = b_dict.get("access") or "Active"
+            branches.append(b_dict)
+        org_dict["branches"] = branches
+        licenses = cloud_db.get_organization_licenses(org_id, user_context=None) or []
+        if licenses:
+            lic = licenses[0]
+            org_dict["tokenKey"] = lic.get("license_key") or lic.get("token_key") or ""
+            org_dict["tokenExpiresAt"] = lic.get("expires_at") or ""
+        branding = cloud_db.get_organization_branding(org_id, user_context=None) or {}
+        org_dict["branding"] = {
+            "appTitle": branding.get("company_name") or f"{org_dict.get('name', 'App')} Application",
+            "logo": branding.get("logo_url") or "",
+        }
+        if not org_dict.get("portal_slug"):
+            org_dict["portal_slug"] = make_portal_slug(org_dict.get("name") or "", org_id)
+        return _decorate_organization_urls(org_dict)
+    except Exception as error:
+        logger.warning("PostgreSQL control-plane read failed for %s: %s", org_id, error)
+        return None
+
+
 def get_all_organizations() -> List[Dict[str, Any]]:
     """Retrieve all organizations with aggregated module, branch, and license info."""
+    if _postgres_control_plane_ready():
+        try:
+            rows = cloud_db.list_organizations(user_context=None)
+            hydrated = []
+            for row in rows or []:
+                bundle = _organization_from_postgres(row["id"])
+                if bundle:
+                    hydrated.append(bundle)
+            if hydrated:
+                return hydrated
+        except Exception as error:
+            logger.warning("PostgreSQL control-plane list failed; using SQLite: %s", error)
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM organizations ORDER BY created_at DESC")
@@ -538,7 +617,7 @@ def get_all_organizations() -> List[Dict[str, Any]]:
             else:
                 org_dict['branding'] = {'appTitle': f"{org_dict.get('name', 'App')} Application", 'logo': ''}
 
-            result.append(org_dict)
+            result.append(_decorate_organization_urls(org_dict))
         return result
 
 def get_organization_by_id(org_id: str) -> Optional[Dict[str, Any]]:
@@ -560,10 +639,11 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
         address = str(data.get('address', '')).strip()
         status = data.get('status', 'Active')
 
+        portal_slug = make_portal_slug(name, org_id)
         cursor.execute('''
-            INSERT INTO organizations (id, name, industry, email, phone, address, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (org_id, name, industry, email, phone, address, status))
+            INSERT INTO organizations (id, name, industry, email, phone, address, status, portal_slug)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (org_id, name, industry, email, phone, address, status, portal_slug))
 
         # Organization Modules
         selected_modules = data.get('modules') or ['attendance', 'employees']
@@ -635,7 +715,7 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
 
         conn.commit()
 
-    if _HAS_CLOUD_DB:
+    if _HAS_CLOUD_DB and cloud_db.postgres_is_configured():
         try:
             cloud_db.create_organization(
                 org_id=org_id,
@@ -644,7 +724,8 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
                 email=email,
                 phone=phone,
                 address=address,
-                status=status
+                status=status,
+                portal_slug=portal_slug,
             )
             b_list = branches_data if branches_data else [{'id': 'BR-01', 'name': 'Main Branch', 'city': '', 'address': address}]
             for b in b_list:
@@ -1116,7 +1197,11 @@ def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
         branch_name = branch_row["name"]
         branch_key = branch_row['token_key'] or (data.get('branchKey') or f"QE-{uuid.uuid4().hex[:16].upper()}")
 
-        client_portal_url = data.get('clientPortalUrl') or default_cloud_url
+        org_row = get_organization_by_id(org_id)
+        client_portal_url = (
+            (org_row or {}).get("clientPortalUrl")
+            or company_portal_url(org_name, org_id)
+        )
         client_username = data.get('clientUsername') or data.get('email') or f"admin@{org_name.lower().replace(' ', '')}.com"
         client_password = str(data.get('clientPassword') or '').strip()
         if len(client_password) < 14:
@@ -1656,6 +1741,13 @@ def get_branch_by_token_key(token_key: str) -> Optional[Dict[str, Any]]:
     clean_key = str(token_key or '').strip()
     if not clean_key:
         return None
+    if _postgres_control_plane_ready():
+        try:
+            pg_branch = cloud_db.get_branch_by_token_key(clean_key)
+            if pg_branch:
+                return pg_branch
+        except Exception as error:
+            logger.warning("PostgreSQL branch-key lookup failed; using SQLite: %s", error)
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''

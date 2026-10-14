@@ -24,6 +24,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE IF NOT EXISTS organizations (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
+    portal_slug VARCHAR(80) UNIQUE,
     industry VARCHAR(100) DEFAULT 'Technology',
     email VARCHAR(255),
     phone VARCHAR(50),
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS organizations (
 
 CREATE INDEX IF NOT EXISTS idx_organizations_status ON organizations(status);
 CREATE INDEX IF NOT EXISTS idx_organizations_created_at ON organizations(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_portal_slug ON organizations(portal_slug);
 
 -- 2. Branches table
 CREATE TABLE IF NOT EXISTS branches (
