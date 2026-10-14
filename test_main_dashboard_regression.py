@@ -573,7 +573,7 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["manual_absent_user_ids"], [101])
         relay.assert_called_once_with(
-            "/api/integration/edge-sync-state",
+            "/api/integration/edge-sync-state?organization_id=ORG-001&branch_id=BR-01",
             method="GET",
         )
 

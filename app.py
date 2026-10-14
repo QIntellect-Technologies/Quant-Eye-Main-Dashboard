@@ -1465,7 +1465,12 @@ def get_edge_sync_state():
             logger.error("Invalid expiry timestamp for branch credential %s", branch_info.get("branch_id"))
             return jsonify({"success": False, "error": "Branch credential configuration is invalid"}), 403
 
-    local_result = query_local_dashboard("/api/integration/edge-sync-state", method="GET")
+    organization_id = str(branch_info["organization_id"])
+    branch_id = str(branch_info["branch_id"])
+    local_result = query_local_dashboard(
+        f"/api/integration/edge-sync-state?organization_id={organization_id}&branch_id={branch_id}",
+        method="GET",
+    )
     if not local_result.get("ok"):
         logger.warning(
             "Could not retrieve branch attendance state from Local Dashboard (HTTP %s).",
@@ -1477,8 +1482,6 @@ def get_edge_sync_state():
         }), 502
 
     local_state = local_result.get("data") or {}
-    organization_id = branch_info["organization_id"]
-    branch_id = branch_info["branch_id"]
     if (
         not local_state.get("success")
         or local_state.get("organization_id") != organization_id
