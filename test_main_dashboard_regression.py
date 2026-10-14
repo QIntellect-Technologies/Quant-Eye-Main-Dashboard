@@ -142,6 +142,76 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertEqual(data["user"]["role"], "organization_admin")
         self.assertEqual(data["user"]["organization_id"], "ORG-001")
 
+    def test_build_creation_returns_validation_errors_and_saves_valid_builds(self):
+        login = self.client.post("/api/auth/login", json={
+            "email": "admin@qintellect.com",
+            "password": "admin123",
+        })
+        self.assertEqual(login.status_code, 200)
+        build_id = f"BUILD-REGRESSION-{uuid.uuid4().hex[:8]}"
+        payload = {
+            "id": build_id,
+            "organizationId": "ORG-001",
+            "organizationName": "Regression Fixture Organization",
+            "branchId": "BR-01",
+            "branchName": "Main Branch",
+            "appName": "Regression Build",
+            "clientUsername": "build@regression.example",
+            "clientPassword": "ValidBuild!Password2026",
+            "modules": ["attendance"],
+        }
+        try:
+            invalid = self.client.post(
+                "/api/builds",
+                json=dict(payload, clientPassword="Pass1234!"),
+            )
+            self.assertEqual(invalid.status_code, 400)
+            self.assertIn("14 characters", invalid.get_json()["error"])
+            self.assertFalse(any(build["id"] == build_id for build in db.get_all_builds()))
+
+            created = self.client.post("/api/builds", json=payload)
+            self.assertEqual(created.status_code, 201, created.get_json())
+            self.assertEqual(created.get_json()["id"], build_id)
+        finally:
+            db.delete_build(build_id)
+
+    def test_delete_organization_removes_associated_build_history(self):
+        org_id = f"ORG-DELETE-{uuid.uuid4().hex[:8]}"
+        org = db.create_organization({
+            "id": org_id,
+            "name": f"Delete Regression {uuid.uuid4().hex[:8]}",
+            "branches": [{"id": "BR-DELETE", "name": "Delete Test Branch"}],
+        })
+        build_id = f"BUILD-DELETE-{uuid.uuid4().hex[:8]}"
+        with db.get_connection() as conn:
+            conn.execute(
+                """INSERT INTO application_builds (
+                       id, organization_id, organization_name, branch_id, branch_name,
+                       app_name, version, modules_snapshot
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    build_id,
+                    org_id,
+                    org["name"],
+                    "BR-DELETE",
+                    "Delete Test Branch",
+                    "Delete Test App",
+                    "v1.0.1",
+                    "[]",
+                ),
+            )
+        login = self.client.post("/api/auth/login", json={
+            "email": "admin@qintellect.com",
+            "password": "admin123",
+        })
+        self.assertEqual(login.status_code, 200)
+
+        deleted = self.client.delete(f"/api/organizations/{org_id}")
+
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+        self.assertIsNone(db.get_organization_by_id(org_id))
+        self.assertFalse(any(build["id"] == build_id for build in db.get_all_builds()))
+
     def test_bootstrap_uses_unique_id_when_configured_email_changes(self):
         """An old bootstrap ID must not crash startup for a newly configured admin email."""
         platform_admin = db.get_user_by_id("USR-PLATFORM-ADMIN")

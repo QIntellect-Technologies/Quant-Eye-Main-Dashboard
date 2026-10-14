@@ -166,7 +166,7 @@
         <button class="btn-outline organization-reset" data-action="reset-organization-filters"><i class="fa-solid fa-rotate-left"></i> Reset</button>
       </div></div><div class="card-body">
         <div class="organization-table-wrap"><table class="organization-table"><thead><tr><th>Organization</th><th>Industry</th><th>Contact</th><th>Modules</th><th>Branches</th><th>Employees</th><th>Status</th><th>Created / Updated</th><th>Actions</th></tr></thead><tbody id="organizationRows"></tbody></table></div>
-        <div class="organization-table-note"><span id="organizationResultCount" aria-live="polite">Showing 0 organizations</span><span>Deleting an organization preserves its demo invoices and build history.</span></div>
+        <div class="organization-table-note"><span id="organizationResultCount" aria-live="polite">Showing 0 organizations</span><span>Deleting an organization also deletes its invoices, payments, branches, and build history.</span></div>
       </div></div>
     </section>
     <section id="modules" class="section" hidden><div class="card"><div class="card-head"><h2>Module Catalog</h2><div class="toolbar"><input id="moduleSearch" placeholder="Search modules"><select id="moduleCategory"><option value="all">All categories</option><option value="core">Core</option><option value="workforce">Workforce</option><option value="analytics">Analytics</option></select></div></div><div class="card-body"><div class="module-grid" id="moduleCatalog"></div></div></div></section>
@@ -313,6 +313,7 @@
     const BANK_DETAILS={accountTitle:"QIntellect Technologies",bankName:"United Bank Limited (UBL)",iban:"PK46UNIL0109000400912116"};
     const seedOrgs=[{id:"ORG-001",name:"Demo Organization",industry:"Technology",email:"admin@demo.local",phone:"",address:"",status:"Active",modules:["attendance","employees","leave","reports"],branches:[{name:"Main Branch",city:"",address:"",access:"Active",graceDays:7}],branding:{logo:"",appTitle:"Demo Organization Application"},createdAt:"2026-10-10T08:00:00Z",updatedAt:"2026-10-10T08:00:00Z"}];
     let organizations=[], builds=[], activity=[], invoices=[];
+    const buildCredentials=new Map();
     let currentPage="overview", selectedBuildOrg="", selectedBuildHistoryOrg="";
     let GLOBAL_CLIENT_URL = "https://quanteye-ai-attendence-production.up.railway.app/";
     fetch("/api/config").then(r=>r.json()).then(cfg=>{if(cfg&&cfg.client_dashboard_url)GLOBAL_CLIENT_URL=cfg.client_dashboard_url;}).catch(()=>{});
@@ -647,20 +648,21 @@
       }
     }
     function openDetails(id){if(!organizations.some(org=>org.id===id))return;selectedOrganizationId=id;showPage("organization-detail")}
-    function confirmOrganizationDelete(id){const org=organizations.find(item=>item.id===id);if(!org){notify("That organization could not be found.",true);return}pendingDeleteOrganizationId=id;openModal(`<h2><i class="fa-solid fa-triangle-exclamation" style="color:var(--danger)"></i> Delete organization?</h2><p>Delete <strong>${esc(org.name)}</strong> (${esc(org.id)}) from this browser's organization directory?</p><div class="summary"><strong>This cannot be undone.</strong> Its demo invoices and application build history will be kept as historical records.</div><div class="form-actions"><button class="btn-outline" data-action="close">Cancel</button><button class="btn-danger" data-action="confirm-delete-organization"><i class="fa-solid fa-trash"></i> Delete organization</button></div>`)}
+    function confirmOrganizationDelete(id){const org=organizations.find(item=>item.id===id);if(!org){notify("That organization could not be found.",true);return}pendingDeleteOrganizationId=id;openModal(`<h2><i class="fa-solid fa-triangle-exclamation" style="color:var(--danger)"></i> Delete organization?</h2><p>Delete <strong>${esc(org.name)}</strong> (${esc(org.id)}) and its organization data?</p><div class="summary"><strong>This cannot be undone.</strong> Branches, invoices, payment records, client users, and application build history for this organization will also be deleted. Platform audit entries are retained.</div><div class="form-actions"><button class="btn-outline" data-action="close">Cancel</button><button class="btn-danger" data-action="confirm-delete-organization"><i class="fa-solid fa-trash"></i> Delete organization</button></div>`)}
     async function deleteOrganization(){
       const id=pendingDeleteOrganizationId,org=organizations.find(item=>item.id===id);
       if(!org){pendingDeleteOrganizationId="";closeModal();notify("That organization no longer exists.",true);return}
       try{
         const res=await fetch(`/api/organizations/${encodeURIComponent(id)}`,{method:"DELETE"});
-        if(!res.ok)throw new Error("HTTP "+res.status);
+        const result=await res.json().catch(()=>({}));
+        if(!res.ok)throw new Error(result.error||`HTTP ${res.status}`);
         if(selectedOrganizationId===id)selectedOrganizationId="";
         pendingDeleteOrganizationId="";
         closeModal();
-        record(`Organization deleted: ${org.name} (${org.id}); invoices and builds retained`,id);
+        record(`Organization deleted: ${org.name} (${org.id}); related records removed`,id);
         await reloadData();
         if(currentPage==="organization-detail")showPage("organizations");else render();
-        notify("Organization deleted. Its demo invoices and build history were preserved.");
+        notify("Organization and its related branch, invoice, payment, and build data deleted.");
       }catch(err){
         notify("Failed to delete organization: "+err.message,true);
       }
@@ -747,11 +749,12 @@
       }
     }
     function buildBranchOptions(org,selectedBranchId=""){return `<option value="">Choose a branch</option>${org?org.branches.map(branch=>`<option value="${esc(branch.id)}" ${branch.id===selectedBranchId?"selected":""}>${esc(branch.name)} · ${Number(branch.employeeCount||0)} employees</option>`).join(""):""}`}
+    function generateClientPassword(){return `Qe!${Array.from(crypto.getRandomValues(new Uint8Array(16)),value=>value.toString(16).padStart(2,"0")).join("")}`}
     function openBuildForm(id="",branchId=""){
       selectedBuildOrg=id;const org=organizations.find(item=>item.id===id);
       if(!org||org.status!=="Active"){notify("Choose an active organization before creating a branch build.",true);return}
       const defaultUser = org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`;
-      const defaultPass = "Pass1234!";
+      const defaultPass = generateClientPassword();
       const cloudUrl = GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
 
       openModal(`
@@ -790,7 +793,7 @@
               </div>
               <div>
                 <label for="buildFormPass" style="font-size:0.8rem; font-weight:700; color:#475569;">Client Password *</label>
-                <input class="form-control" id="buildFormPass" name="clientPassword" value="${esc(defaultPass)}" required>
+                <input class="form-control" id="buildFormPass" name="clientPassword" type="password" autocomplete="new-password" minlength="14" value="${esc(defaultPass)}" required>
               </div>
             </div>
           </div>
@@ -831,12 +834,13 @@
       const appName=String(form.get("appName")||"").trim();
       const clientPortalUrl=String(form.get("clientPortalUrl")||GLOBAL_CLIENT_URL).trim();
       const clientUsername=String(form.get("clientUsername")||"").trim();
-      const clientPassword=String(form.get("clientPassword")||"Pass1234!").trim();
+      const clientPassword=String(form.get("clientPassword")||"").trim();
 
       if(!org||org.status!=="Active"){notify("Choose an active organization first.",true);return}
       if(!branch){notify("Choose a branch for this build.",true);return}
       if(effectiveBranchAccess(org,branch)!=="Active"){notify("Choose an active branch before starting a build.",true);return}
       if(!appName){notify("Enter an application name.",true);return}
+      if(clientPassword.length<14){notify("Client password must contain at least 14 characters.",true);return}
 
       const build={
         id:`BUILD-${String(Date.now()).slice(-8)}`,
@@ -856,7 +860,10 @@
       };
 
       try{
-        await fetch("/api/builds",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(build)});
+        const response=await fetch("/api/builds",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(build)});
+        const result=await response.json().catch(()=>({}));
+        if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);
+        buildCredentials.set(build.id,clientPassword);
         record(`Build ${build.version} queued for ${org.name} · ${branch.name}`,org.id,branch.id);
         await reloadData();
         closeModal();
@@ -929,7 +936,7 @@
       const branchKey = (branch&&branch.tokenKey)||(build&&build.branchKey)||(org&&org.tokenKey)||"QE-9A5DDEE7B01A41C18B2F";
       const clientUrl = build.clientPortalUrl || GLOBAL_CLIENT_URL || "https://quanteye-ai-attendence-production.up.railway.app/";
       const defaultUser = build.clientUsername || (org ? (org.email || `admin@${org.name.toLowerCase().replace(/\s+/g,'')}.com`) : "admin@client.com");
-      const defaultPass = build.clientPassword || "Pass1234!";
+      const defaultPass = buildCredentials.get(build.id) || "";
 
       const handoverText = `🚀 QINTELLECT CLIENT PORTAL & AI NODE CREDENTIALS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -944,7 +951,7 @@ ${clientUrl}
 ${defaultUser}
 
 🔑 Client Login Password:
-${defaultPass}
+${defaultPass || "Not available in this browser session; create a replacement build to issue new credentials."}
 
 📹 Standalone AI CCTV Branch Key:
 ${branchKey}
@@ -994,8 +1001,8 @@ ${(build.modules||[]).map(moduleName).join(", ")}
             <div>
               <small style="color:#64748b; font-weight:700;">Password:</small>
               <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
-                <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; flex:1;">${esc(defaultPass)}</div>
-                <button type="button" class="btn-outline" style="padding:6px 8px;" onclick="copyToClipboard('${esc(defaultPass)}', 'Password')"><i class="fa-solid fa-copy"></i></button>
+                <div class="mono" style="background:#fff; border:1px solid #cfe8f7; border-radius:6px; padding:6px 10px; font-weight:700; flex:1;">${defaultPass?esc(defaultPass):"Unavailable after browser refresh; create a replacement build to issue new credentials."}</div>
+                ${defaultPass?`<button type="button" class="btn-outline" style="padding:6px 8px;" onclick="copyToClipboard('${esc(defaultPass)}', 'Password')"><i class="fa-solid fa-copy"></i></button>`:""}
               </div>
             </div>
           </div>

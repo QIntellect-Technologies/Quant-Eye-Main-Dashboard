@@ -572,13 +572,13 @@ def delete_organization(org_id):
         success = db.delete_organization(org_id)
 
         # Delete from PostgreSQL cloud DB (prevents orgs from reappearing after restart)
-        if _HAS_CLOUD_DB:
+        if cloud_db is not None:
             try:
                 cloud_db.delete_organization(org_id)
             except Exception as ce:
                 logger.warning(f"cloud_db.delete_organization failed for {org_id}: {ce}")
 
-        if not success and not _HAS_CLOUD_DB:
+        if not success and cloud_db is None:
             return jsonify({"success": False, "error": f"Organization '{org_id}' not found."}), 404
 
         # Also purge organization's data from Client Portal (Local Dashboard)
@@ -747,6 +747,8 @@ def create_build():
     try:
         build = db.create_build(payload)
         return jsonify(build), 201
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

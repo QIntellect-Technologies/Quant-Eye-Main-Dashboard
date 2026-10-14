@@ -819,6 +819,23 @@ def delete_organization(org_id: str) -> bool:
         if not row:
             return False
         org_name = row['name']
+        cursor.execute(
+            "DELETE FROM payments WHERE invoice_id IN (SELECT id FROM invoices WHERE organization_id = ?)",
+            (org_id,),
+        )
+        cursor.execute(
+            "DELETE FROM invoice_items WHERE invoice_id IN (SELECT id FROM invoices WHERE organization_id = ?)",
+            (org_id,),
+        )
+        cursor.execute("DELETE FROM invoices WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM application_builds WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM branch_contacts WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM branch_cameras WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM control_plane_users WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM organization_contacts WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM organization_modules WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM organization_licenses WHERE organization_id = ?", (org_id,))
+        cursor.execute("DELETE FROM organization_branding WHERE organization_id = ?", (org_id,))
         cursor.execute("DELETE FROM organizations WHERE id = ?", (org_id,))
         cursor.execute('''
             INSERT INTO platform_audit_logs (organization_id, action, message)
@@ -1085,10 +1102,19 @@ def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
         status = data.get('status', 'queued')
         progress = int(data.get('progress', 0) or 0)
 
-        # Query branch token key
-        cursor.execute("SELECT token_key FROM branches WHERE organization_id = ? AND id = ?", (org_id, branch_id))
+        if not org_id or not branch_id:
+            raise ValueError("An organization and branch are required for a build.")
+
+        # Resolve the target branch before creating a build so invalid IDs fail clearly.
+        cursor.execute(
+            "SELECT name, token_key FROM branches WHERE organization_id = ? AND id = ?",
+            (org_id, branch_id),
+        )
         branch_row = cursor.fetchone()
-        branch_key = branch_row['token_key'] if branch_row and branch_row['token_key'] else (data.get('branchKey') or f"QE-{uuid.uuid4().hex[:16].upper()}")
+        if not branch_row:
+            raise ValueError("The selected branch does not belong to this organization.")
+        branch_name = branch_row["name"]
+        branch_key = branch_row['token_key'] or (data.get('branchKey') or f"QE-{uuid.uuid4().hex[:16].upper()}")
 
         client_portal_url = data.get('clientPortalUrl') or default_cloud_url
         client_username = data.get('clientUsername') or data.get('email') or f"admin@{org_name.lower().replace(' ', '')}.com"
