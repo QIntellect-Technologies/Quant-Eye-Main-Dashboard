@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template, request, session
+from flask import Flask, jsonify, redirect, render_template, request, session
 import os
 import json
 import secrets
@@ -430,6 +430,7 @@ def dashboard():
         modules=db.get_module_catalog() if is_authenticated else [],
         organizations=db.get_all_organizations() if is_authenticated else [],
         is_authenticated=is_authenticated,
+        client_dashboard_url=DEFAULT_CLIENT_URL,
     )
 
 
@@ -442,8 +443,16 @@ def attendance_report_page():
 @app.get("/client/portal")
 @app.get("/client-portal")
 def client_portal_page():
-    """Serve the existing Client Portal (Staff, Leaves, Overtime, Shifts, Payroll)."""
-    return render_template("local/index.html", is_cloud=True)
+    """Send client portal visitors to the configured portal with their requested tenant context."""
+    tenant_context = {}
+    for key in ("organization_id", "branch_id"):
+        value = request.args.get(key, "").strip()
+        if value:
+            tenant_context[key] = value
+    portal_url = f"{DEFAULT_CLIENT_URL.rstrip('/')}/"
+    if tenant_context:
+        portal_url = f"{portal_url}?{urlencode(tenant_context)}"
+    return redirect(portal_url, code=302)
 
 
 @app.get("/api/dashboard/stats")

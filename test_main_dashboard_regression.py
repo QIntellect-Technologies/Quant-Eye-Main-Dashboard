@@ -94,6 +94,27 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertIn("client_dashboard_url", data)
         self.assertIn("main_dashboard_url", data)
 
+    def test_client_portal_link_redirects_to_configured_client_service(self):
+        with patch("app.DEFAULT_CLIENT_URL", "https://client.example.test/"):
+            response = self.client.get(
+                "/client/portal?organization_id=ORG-001&branch_id=BR-01"
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers["Location"],
+            "https://client.example.test/?organization_id=ORG-001&branch_id=BR-01",
+        )
+
+    def test_dashboard_uses_configured_client_portal_url(self):
+        with patch("app.DEFAULT_CLIENT_URL", "https://client.example.test/"):
+            response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            b'let GLOBAL_CLIENT_URL = "https://client.example.test/";',
+            response.data,
+        )
+        self.assertIn(b'clientPortalHref(org,branch)', response.data)
+
     @patch("app._load_branch_cameras", return_value=[{"id": "cam-1", "rtsp_url": "rtsp://camera/stream"}])
     @patch("app.db.get_branch_by_token_key")
     def test_branch_camera_endpoint_requires_and_uses_branch_key(self, get_branch_by_token_key, load_cameras):
