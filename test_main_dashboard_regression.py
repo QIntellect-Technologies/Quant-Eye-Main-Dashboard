@@ -94,6 +94,29 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertIn("client_dashboard_url", data)
         self.assertIn("main_dashboard_url", data)
 
+    @patch("app._load_branch_cameras", return_value=[{"id": "cam-1", "rtsp_url": "rtsp://camera/stream"}])
+    @patch("app.db.get_branch_by_token_key")
+    def test_branch_camera_endpoint_requires_and_uses_branch_key(self, get_branch_by_token_key, load_cameras):
+        with self.client.session_transaction() as session:
+            session.clear()
+
+        denied = self.client.get("/api/branches/BR-01/cameras")
+        self.assertEqual(denied.status_code, 401)
+
+        get_branch_by_token_key.return_value = {
+            "branch_id": "BR-01",
+            "organization_id": "ORG-001",
+            "organization_status": "Active",
+            "branch_access": "Active",
+        }
+        response = self.client.get(
+            "/api/branches/BR-01/cameras",
+            headers={"X-Branch-Key": "QE-TEST-KEY"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["cameras"], load_cameras.return_value)
+        load_cameras.assert_called_once_with("ORG-001", "BR-01")
+
     def test_02_protected_routes_require_a_valid_session(self):
         """Unauthenticated requests and stale session IDs must not acquire admin access."""
         with self.client.session_transaction() as session:
@@ -512,6 +535,21 @@ class TestMainDashboardRegression(unittest.TestCase):
                     "/api/integration/sync",
                     method="POST",
                     payload={"organization_id": "ORG-001", "branch_id": "BR-01"},
+                )
+        self.assertTrue(result["ok"])
+        sent_request = urlopen.call_args.args[0]
+        self.assertEqual(sent_request.headers.get("X-integration-key"), shared_key)
+
+    def test_local_dashboard_camera_proxy_uses_integration_key_with_query_string(self):
+        shared_key = "MainLocal-Integration-Test-Key-2026-Secure"
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = b'{"success": true, "cameras": []}'
+        with patch.dict(os.environ, {"LOCAL_DASHBOARD_API_KEY": shared_key}):
+            with patch("urllib.request.urlopen", return_value=response) as urlopen:
+                result = query_local_dashboard(
+                    "/api/integration/cameras?organization_id=ORG-001&branch_id=BR-01",
                 )
         self.assertTrue(result["ok"])
         sent_request = urlopen.call_args.args[0]

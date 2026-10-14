@@ -8,7 +8,7 @@ import urllib.error
 import threading
 from functools import wraps
 from datetime import datetime
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from typing import Any, Dict
 from werkzeug.security import check_password_hash
 from jinja2 import ChoiceLoader, FileSystemLoader, PrefixLoader
@@ -931,9 +931,11 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
     url = f"{local_base_url}{endpoint}"
     data = None
     headers = {"Content-Type": "application/json"}
-    if endpoint.rstrip("/") in {
+    endpoint_path = urlsplit(endpoint).path.rstrip("/")
+    if endpoint_path in {
         "/api/integration/sync",
         "/api/integration/edge-sync-state",
+        "/api/integration/cameras",
         "/api/attendance/edge-mark",
     }:
         integration_key = os.environ.get("LOCAL_DASHBOARD_API_KEY", "").strip()
@@ -1183,108 +1185,103 @@ def get_employees_for_branch(branch_id):
     }), 200
 
 
+def _normalize_branch_cameras(cameras):
+    normalized = []
+    for camera in cameras:
+        camera_id = str(camera.get("camera_id") or camera.get("id") or "").strip()
+        rtsp_url = str(camera.get("rtsp_url") or "").strip()
+        active = str(camera.get("active", 1)).strip().lower()
+        if not camera_id or not rtsp_url or active in {"0", "false", "inactive", "disabled"}:
+            continue
+        camera_name = camera.get("name") or camera.get("camera_name") or f"Camera {camera_id}"
+        normalized.append({
+            **camera,
+            "id": camera_id,
+            "camera_id": camera_id,
+            "name": camera_name,
+            "camera_name": camera_name,
+            "rtsp_url": rtsp_url,
+            "room_name": camera.get("room_name") or camera.get("location") or "AI ROOM",
+            "active": 1,
+        })
+    return normalized
+
+
+def _load_branch_cameras(org_id, branch_id):
+    """Load branch cameras from the client portal, then cloud DB or local cache."""
+    query = urlencode({"organization_id": org_id, "branch_id": branch_id, "active_only": "true"})
+    portal_result = query_local_dashboard(f"/api/integration/cameras?{query}")
+    if portal_result.get("ok"):
+        portal_data = portal_result.get("data") or {}
+        if (
+            portal_data.get("success")
+            and str(portal_data.get("organization_id")) == str(org_id)
+            and str(portal_data.get("branch_id")) == str(branch_id)
+            and isinstance(portal_data.get("cameras"), list)
+        ):
+            cameras = _normalize_branch_cameras(portal_data["cameras"])
+            try:
+                db.set_branch_cameras(org_id, branch_id, cameras)
+            except Exception:
+                logger.exception("Could not refresh local branch camera cache.")
+            if cloud_db is not None:
+                try:
+                    cloud_db.set_cloud_cameras(org_id, branch_id, cameras)
+                except Exception as error:
+                    logger.debug("Could not mirror portal branch cameras to PostgreSQL: %s", error)
+            return cameras
+        logger.warning("Client portal returned an invalid branch camera response for %s/%s.", org_id, branch_id)
+    else:
+        logger.warning(
+            "Could not load branch cameras from Client Portal (HTTP %s): %s",
+            portal_result.get("status_code"),
+            portal_result.get("error"),
+        )
+
+    if cloud_db is not None:
+        try:
+            return _normalize_branch_cameras(cloud_db.get_cloud_cameras(org_id, branch_id))
+        except Exception as error:
+            logger.warning("Could not query PostgreSQL branch cameras: %s", error)
+
+    cached_cameras = db.get_branch_cameras(org_id, branch_id)
+    return _normalize_branch_cameras(cached_cameras) if cached_cameras else None
+
+
 @app.get("/api/branches/<branch_id>/cameras")
 def get_cameras_for_branch(branch_id):
     """Fetch cloud-configured camera streams for a client node or dashboard."""
-    org_id = request.args.get("organization_id")
-    try:
+    branch_key = request.headers.get("X-Branch-Key", "")
+    if branch_key:
+        branch_info = db.get_branch_by_token_key(branch_key)
+        if not branch_info or branch_info.get("branch_id") != branch_id:
+            return jsonify({"success": False, "error": "Valid branch credentials are required."}), 401
+        if branch_info.get("organization_status") != "Active" or branch_info.get("branch_access") != "Active":
+            return jsonify({"success": False, "error": "Branch access is suspended or inactive."}), 403
+        org_id = branch_info["organization_id"]
+    else:
         user = get_current_user()
-        if user and user.get("role") == "organization_admin":
+        if not user:
+            return jsonify({"success": False, "error": "Branch credentials or dashboard authentication are required."}), 401
+        org_id = request.args.get("organization_id", "")
+        if user.get("role") == "organization_admin":
             org_id = user.get("organization_id")
-    except Exception:
-        pass
+        elif user.get("role") != "platform_admin":
+            return jsonify({"success": False, "error": "Access forbidden."}), 403
+        organization = db.get_organization_by_id(org_id) if org_id else None
+        branches = organization.get("branches", []) if organization else []
+        if not any(str(branch.get("id")) == str(branch_id) for branch in branches):
+            return jsonify({"success": False, "error": "Branch was not found for this organization."}), 404
 
-    if not org_id:
-        org_id = "ORG-001"
-
-    # 1. Query PostgreSQL cloud database
-    try:
-        import cloud_database as cloud_db
-        pg_cams = cloud_db.get_cloud_cameras(org_id, branch_id)
-        if pg_cams:
-            return jsonify({
-                "success": True,
-                "organization_id": org_id,
-                "branch_id": branch_id,
-                "cameras": pg_cams,
-                "count": len(pg_cams)
-            }), 200
-    except Exception as e:
-        logger.warning("Could not query PostgreSQL cameras: %s", e)
-
-    # 2. Query Client Portal / Local Dashboard API (where client configured RTSP/NVR cameras)
-    try:
-        portal_url = LOCAL_DASHBOARD_URL.rstrip('/')
-        portal_headers = {
-            "User-Agent": "QuantEye-Main-Dashboard",
-            "X-Organization-Id": org_id,
-            "X-Branch-Id": branch_id
-        }
-        req = urllib.request.Request(
-            f"{portal_url}/api/cameras?active_only=true&organization_id={urllib.parse.quote(org_id)}&branch_id={urllib.parse.quote(branch_id)}",
-            headers=portal_headers
-        )
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
-            if resp.status == 200:
-                p_cams = json.loads(resp.read().decode('utf-8'))
-                matching = []
-                for c in p_cams:
-                    c_org = c.get("organization_id")
-                    c_br = c.get("branch_id")
-                    if (not c_org or c_org in (org_id, 'DEFAULT_ORG')) and (not c_br or c_br in (branch_id, 'DEFAULT_BRANCH')):
-                        matching.append({
-                            "camera_id": c.get("camera_id") or f"cam_{c.get('id')}",
-                            "id": c.get("camera_id") or f"cam_{c.get('id')}",
-                            "name": c.get("name") or c.get("camera_name", "Camera"),
-                            "camera_name": c.get("name") or c.get("camera_name", "Camera"),
-                            "camera_type": c.get("camera_type", "nvr"),
-                            "rtsp_url": c.get("rtsp_url", "0"),
-                            "room_name": c.get("room_name", "AI ROOM"),
-                            "location": c.get("room_name", "AI ROOM"),
-                            "channel_number": c.get("channel_number", 1),
-                            "active": c.get("active", 1)
-                        })
-                # Portal is authoritative: sync current state to PostgreSQL and SQLite (even if 0 cameras after deletion)
-                try:
-                    import cloud_database as cloud_db
-                    cloud_db.set_cloud_cameras(org_id, branch_id, matching)
-                except Exception as e_sync:
-                    logger.debug("Could not auto-sync portal cams to PG: %s", e_sync)
-                try:
-                    db.set_branch_cameras(org_id, branch_id, matching)
-                except Exception:
-                    pass
-                return jsonify({
-                    "success": True,
-                    "organization_id": org_id,
-                    "branch_id": branch_id,
-                    "cameras": matching,
-                    "count": len(matching)
-                }), 200
-    except Exception as pe:
-        logger.warning("Could not query client portal cameras: %s", pe)
-
-    # 3. Fallback to SQLite cache
-    try:
-        cams = db.get_branch_cameras(org_id, branch_id)
-        if cams:
-            return jsonify({
-                "success": True,
-                "organization_id": org_id,
-                "branch_id": branch_id,
-                "cameras": cams,
-                "count": len(cams)
-            }), 200
-    except Exception as e:
-        logger.warning("Could not query SQLite branch cameras: %s", e)
-
-    # 4. If no cameras configured, return empty list (never return fake webcam 0)
+    cameras = _load_branch_cameras(org_id, branch_id)
+    if cameras is None:
+        return jsonify({"success": False, "error": "Branch camera configuration is temporarily unavailable."}), 503
     return jsonify({
         "success": True,
         "organization_id": org_id,
         "branch_id": branch_id,
-        "cameras": [],
-        "count": 0
+        "cameras": cameras,
+        "count": len(cameras)
     }), 200
 
 
@@ -1793,39 +1790,10 @@ def validate_edge_branch_key():
     org_id = branch_info["organization_id"]
     b_id = branch_info["branch_id"]
 
-    # Fetch dynamic cameras configured for this specific branch
-    cameras = db.get_branch_cameras(org_id, b_id)
-    if not cameras:
-        try:
-            local_cams_resp = query_local_dashboard("/api/cameras", method="GET")
-            if local_cams_resp.get("ok") and isinstance(local_cams_resp.get("data"), list) and local_cams_resp.get("data"):
-                cameras = []
-                for idx, lc in enumerate(local_cams_resp["data"], start=1):
-                    cameras.append({
-                        "id": lc.get("camera_id") or f"cam_{lc.get('id')}",
-                        "name": lc.get("name") or f"Camera {idx}",
-                        "camera_type": lc.get("camera_type", "rtsp"),
-                        "rtsp_url": str(lc.get("rtsp_url", "")),
-                        "room_name": lc.get("room_name", "Entrance"),
-                        "channel_number": idx,
-                        "active": int(lc.get("active", 1))
-                    })
-                db.set_branch_cameras(org_id, b_id, cameras)
-        except Exception:
-            pass
-
-    if not cameras:
-        cameras = [
-            {
-                "id": "cam_webcam_0",
-                "name": f"{branch_info['branch_name']} Camera 1",
-                "camera_type": "webcam",
-                "rtsp_url": "0",
-                "room_name": "Main Entrance",
-                "channel_number": 1,
-                "active": 1
-            }
-        ]
+    cameras = _load_branch_cameras(org_id, b_id)
+    camera_sync_available = cameras is not None
+    if cameras is None:
+        cameras = []
 
     return jsonify({
         "success": True,
@@ -1836,6 +1804,7 @@ def validate_edge_branch_key():
         "token_expires_at": branch_info.get("token_expires_at"),
         "cameras": cameras,
         "camera_count": len(cameras),
+        "camera_sync_available": camera_sync_available,
         "message": f"Successfully authenticated {branch_info['organization_name']} - {branch_info['branch_name']}"
     }), 200
 
