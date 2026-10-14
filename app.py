@@ -1553,6 +1553,70 @@ def sync_edge_employee_embeddings(branch_id, user_id):
     return jsonify(response), 200
 
 
+@app.get("/api/edge/branches/<branch_id>/employees/<int:user_id>/embeddings")
+def get_edge_employee_embeddings(branch_id, user_id):
+    """Relay trained face templates to the authenticated Client Node for its branch."""
+    branch_key = request.headers.get("X-Branch-Key", "").strip()
+    if not branch_key:
+        return jsonify({"success": False, "error": "Branch authentication required"}), 401
+
+    branch_info = db.get_branch_by_token_key(branch_key)
+    if not branch_info or str(branch_info.get("branch_id")) != str(branch_id):
+        return jsonify({"success": False, "error": "Invalid branch credential"}), 401
+    if (
+        branch_info.get("organization_status") != "Active"
+        or branch_info.get("branch_access") != "Active"
+    ):
+        return jsonify({"success": False, "error": "Organization or branch is inactive"}), 403
+
+    expires_at = branch_info.get("token_expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            now = datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.now()
+            if expiry <= now:
+                return jsonify({"success": False, "error": "Branch credential has expired"}), 401
+        except ValueError:
+            logger.error("Invalid expiry timestamp for branch credential %s", branch_id)
+            return jsonify({"success": False, "error": "Branch credential configuration is invalid"}), 403
+
+    relay_path = (
+        f"/api/integration/employees/{user_id}/embeddings"
+        f"?organization_id={branch_info['organization_id']}&branch_id={branch_id}"
+    )
+    result = query_local_dashboard(relay_path, method="GET")
+    if not result.get("ok"):
+        logger.warning(
+            "Could not retrieve face templates for employee %s in branch %s (HTTP %s).",
+            user_id,
+            branch_id,
+            result.get("status_code"),
+        )
+        status = result.get("status_code")
+        return jsonify({
+            "success": False,
+            "error": "Client Portal biometric templates are temporarily unavailable.",
+        }), status if isinstance(status, int) and 400 <= status < 500 else 502
+
+    response = result.get("data") or {}
+    vectors = response.get("embeddings")
+    if (
+        response.get("success") is not True
+        or str(response.get("organization_id")) != str(branch_info["organization_id"])
+        or str(response.get("branch_id")) != str(branch_id)
+        or int(response.get("user_id", -1)) != int(user_id)
+        or not isinstance(vectors, list)
+        or len(vectors) > 20
+    ):
+        logger.error("Client Portal returned mismatched face templates for employee %s.", user_id)
+        return jsonify({
+            "success": False,
+            "error": "Client Portal returned invalid biometric templates.",
+        }), 502
+
+    return jsonify(response), 200
+
+
 # ==============================================================================
 # PHASE 2.4: CLOUD REPORTING & DATA ENDPOINTS (REAL POSTGRESQL DATA ONLY)
 # ==============================================================================

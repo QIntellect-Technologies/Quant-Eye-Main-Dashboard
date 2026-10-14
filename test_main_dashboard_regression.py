@@ -211,6 +211,50 @@ class TestMainDashboardRegression(unittest.TestCase):
             payload=payload,
         )
 
+    @patch("app.query_local_dashboard")
+    @patch("app.db.get_branch_by_token_key")
+    def test_branch_face_template_download_requires_branch_key_and_checks_branch_binding(self, get_branch, relay):
+        get_branch.return_value = {
+            "branch_id": "BR-01",
+            "organization_id": "ORG-001",
+            "organization_status": "Active",
+            "branch_access": "Active",
+        }
+        relay.return_value = {
+            "ok": True,
+            "status_code": 200,
+            "data": {
+                "success": True,
+                "organization_id": "ORG-001",
+                "branch_id": "BR-01",
+                "user_id": 17,
+                "embeddings": [[0.5] * 512],
+                "is_trained": True,
+            },
+        }
+        endpoint = "/api/edge/branches/BR-01/employees/17/embeddings"
+
+        denied = self.client.get(endpoint)
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.get(
+            endpoint,
+            headers={"X-Branch-Key": "QE-TEST-KEY"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["embeddings"], [[0.5] * 512])
+        relay.assert_called_once_with(
+            "/api/integration/employees/17/embeddings?organization_id=ORG-001&branch_id=BR-01",
+            method="GET",
+        )
+
+        relay.return_value["data"]["branch_id"] = "BR-OTHER"
+        mismatched = self.client.get(
+            endpoint,
+            headers={"X-Branch-Key": "QE-TEST-KEY"},
+        )
+        self.assertEqual(mismatched.status_code, 502)
+
     def test_02_protected_routes_require_a_valid_session(self):
         """Unauthenticated requests and stale session IDs must not acquire admin access."""
         with self.client.session_transaction() as session:
