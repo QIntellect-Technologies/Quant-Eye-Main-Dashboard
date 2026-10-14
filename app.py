@@ -2,10 +2,14 @@ from flask import Flask, jsonify, render_template, request, session
 import os
 import json
 import secrets
+import uuid
 import urllib.request
 import urllib.error
+import threading
 from functools import wraps
 from datetime import datetime
+from urllib.parse import urlsplit
+from typing import Any, Dict
 from werkzeug.security import check_password_hash
 from jinja2 import ChoiceLoader, FileSystemLoader, PrefixLoader
 import database as db
@@ -19,7 +23,15 @@ except Exception as _cdb_err:
     logger.warning("Cloud PostgreSQL module not loaded: %s", _cdb_err)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)
+_production_runtime = (
+    bool(os.environ.get("RAILWAY_ENVIRONMENT"))
+    or os.environ.get("APP_ENV", "").lower() == "production"
+    or os.environ.get("FLASK_ENV", "").lower() == "production"
+)
+_configured_secret_key = os.environ.get("FLASK_SECRET_KEY")
+if _production_runtime and len((_configured_secret_key or "").strip()) < 32:
+    raise RuntimeError("FLASK_SECRET_KEY must contain at least 32 characters in production.")
+app.secret_key = _configured_secret_key or secrets.token_urlsafe(48)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax'
@@ -42,6 +54,132 @@ DEFAULT_CLIENT_URL = os.environ.get("CLIENT_DASHBOARD_URL") or os.environ.get("L
 LOCAL_DASHBOARD_URL = os.environ.get("LOCAL_DASHBOARD_URL", DEFAULT_CLIENT_URL)
 LOCAL_HTTP_TIMEOUT = float(os.environ.get("LOCAL_HTTP_TIMEOUT", "3.0"))
 
+
+def _validate_service_url(url: str, name: str) -> str:
+    parsed = urlsplit(url)
+    local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    development = (
+        app.testing
+        or os.environ.get("FLASK_ENV", "").lower() in {"development", "testing"}
+        or os.environ.get("APP_ENV", "").lower() in {"development", "test"}
+    )
+    if parsed.scheme != "https" and not (
+        not _production_runtime and development and local_http
+    ):
+        raise ValueError(f"{name} must use HTTPS outside explicit local development/test mode.")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{name} is not a valid service URL.")
+    return url.rstrip("/")
+
+
+if _production_runtime:
+    if len(os.environ.get("LOCAL_DASHBOARD_API_KEY", "").strip()) < 32:
+        raise RuntimeError("LOCAL_DASHBOARD_API_KEY must contain at least 32 characters in production.")
+    _validate_service_url(LOCAL_DASHBOARD_URL, "LOCAL_DASHBOARD_URL")
+
+
+_postgres_sync_wakeup = threading.Event()
+_postgres_sync_worker_lock = threading.Lock()
+_postgres_sync_worker_started = False
+
+
+def _persist_attendance_event_to_postgres(
+    event_payload: Dict[str, Any],
+    source_event_id: str,
+    organization_id: str,
+    branch_id: str,
+) -> None:
+    if cloud_db is None:
+        raise RuntimeError("PostgreSQL persistence module is unavailable.")
+    with cloud_db.tenant_context(
+        org_id=organization_id,
+        branch_id=branch_id,
+        is_platform_admin=True,
+        enforce_rls=False,
+    ) as cur:
+        employee_value = str(event_payload.get("user_id") or "1")
+        cur.execute(
+            "SELECT id FROM employees WHERE organization_id = %s AND (id = %s OR employee_code = %s);",
+            (organization_id, employee_value, employee_value),
+        )
+        employee_row = cur.fetchone()
+        employee_id = employee_row["id"] if employee_row else employee_value
+        if not employee_row:
+            cur.execute(
+                """INSERT INTO employees (
+                       id, organization_id, branch_id, employee_code, name, is_active
+                   ) VALUES (%s, %s, %s, %s, %s, TRUE)
+                   ON CONFLICT (organization_id, id) DO NOTHING;""",
+                (
+                    employee_id,
+                    organization_id,
+                    branch_id,
+                    employee_value,
+                    event_payload.get("name", "Employee"),
+                ),
+            )
+        cur.execute(
+            """INSERT INTO attendance_events (
+                   id, organization_id, branch_id, employee_id, camera_id,
+                   timestamp, event_type, confidence, sync_status
+               ) VALUES (%s, %s, %s, %s, %s, %s, 'CHECK_IN', %s, 'synced')
+               ON CONFLICT (organization_id, id) DO NOTHING;""",
+            (
+                f"EVT-{source_event_id}",
+                organization_id,
+                branch_id,
+                employee_id,
+                event_payload.get("camera_id") or "edge_node",
+                event_payload.get("timestamp") or datetime.now().isoformat(),
+                float(event_payload.get("confidence") or 1.0),
+            ),
+        )
+
+
+def _postgres_attendance_sync_worker() -> None:
+    while True:
+        try:
+            pending_rows = db.get_due_attendance_postgres_sync()
+            if not pending_rows:
+                _postgres_sync_wakeup.wait(timeout=5)
+                _postgres_sync_wakeup.clear()
+                continue
+            for pending in pending_rows:
+                event_id = pending["source_event_id"]
+                try:
+                    _persist_attendance_event_to_postgres(
+                        json.loads(pending["payload_json"]),
+                        event_id,
+                        pending["organization_id"],
+                        pending["branch_id"],
+                    )
+                    db.mark_attendance_postgres_sync_succeeded(event_id)
+                except Exception as error:
+                    db.mark_attendance_postgres_sync_failed(event_id, str(error))
+                    logger.warning(
+                        "PostgreSQL attendance replica for event %s remains pending: %s",
+                        event_id,
+                        error,
+                    )
+        except Exception:
+            logger.exception("PostgreSQL attendance retry worker failed.")
+            _postgres_sync_wakeup.wait(timeout=5)
+            _postgres_sync_wakeup.clear()
+
+
+def _ensure_postgres_attendance_sync_worker() -> None:
+    global _postgres_sync_worker_started
+    with _postgres_sync_worker_lock:
+        if not _postgres_sync_worker_started:
+            threading.Thread(
+                target=_postgres_attendance_sync_worker,
+                name="attendance-postgres-sync",
+                daemon=True,
+            ).start()
+            _postgres_sync_worker_started = True
+    _postgres_sync_wakeup.set()
+
+
 @app.get("/api/config")
 def get_system_config():
     """Return cloud deployment endpoints and configuration."""
@@ -56,23 +194,13 @@ def get_system_config():
 # ==============================================================================
 
 def get_current_user():
-    """Return active user dictionary if logged in, else Platform Admin fallback."""
+    """Return the active session user, or None when no valid session exists."""
     user_id = session.get('user_id')
     if user_id:
         user = db.get_user_by_id(user_id)
         if user and user.get('active'):
             return user
-    # Fallback to default platform admin so control plane operations persist to SQLite
-    admin = db.get_user_by_email("admin@qintellect.com")
-    if admin:
-        return admin
-    return {
-        "id": "USR-PLATFORM-ADMIN",
-        "name": "Platform Administrator",
-        "email": "admin@qintellect.com",
-        "role": "platform_admin",
-        "active": 1
-    }
+    return None
 
 def require_auth(allowed_roles=None):
     """Decorator ensuring request is from an active authenticated user."""
@@ -790,9 +918,26 @@ def sync_localstorage():
 
 def query_local_dashboard(endpoint, method="GET", payload=None):
     """Safely query Local Dashboard via HTTP. Never crash Main Dashboard on failure."""
-    url = f"{LOCAL_DASHBOARD_URL.rstrip('/')}{endpoint}"
+    try:
+        local_base_url = _validate_service_url(LOCAL_DASHBOARD_URL, "LOCAL_DASHBOARD_URL")
+    except ValueError as error:
+        return {"ok": False, "status_code": 503, "error": str(error)}
+    url = f"{local_base_url}{endpoint}"
     data = None
     headers = {"Content-Type": "application/json"}
+    if endpoint.rstrip("/") in {
+        "/api/integration/sync",
+        "/api/integration/edge-sync-state",
+        "/api/attendance/edge-mark",
+    }:
+        integration_key = os.environ.get("LOCAL_DASHBOARD_API_KEY", "").strip()
+        if len(integration_key) < 32:
+            return {
+                "ok": False,
+                "status_code": 503,
+                "error": "Local Dashboard integration authentication is not securely configured."
+            }
+        headers["X-Integration-Key"] = integration_key
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
 
@@ -1181,63 +1326,185 @@ def ingest_attendance_event():
     Called immediately by QuantEye-Client-Node whenever a face is recognized.
     """
     event_payload = request.get_json(silent=True) or {}
+    if not isinstance(event_payload, dict):
+        return jsonify({"success": False, "error": "Invalid attendance event"}), 400
+    branch_key = request.headers.get("X-Branch-Key", "").strip()
+    if not branch_key:
+        return jsonify({"success": False, "error": "Branch authentication required"}), 401
+    branch_info = db.get_branch_by_token_key(branch_key)
+    if not branch_info:
+        return jsonify({"success": False, "error": "Invalid branch credential"}), 401
+    if (
+        branch_info.get("organization_status") != "Active"
+        or branch_info.get("branch_access") != "Active"
+    ):
+        return jsonify({"success": False, "error": "Organization or branch is inactive"}), 403
+    expires_at = branch_info.get("token_expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            now = datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.now()
+            if expiry <= now:
+                return jsonify({"success": False, "error": "Branch credential has expired"}), 401
+        except ValueError:
+            logger.error("Invalid expiry timestamp for branch credential %s", branch_info.get("branch_id"))
+            return jsonify({"success": False, "error": "Branch credential configuration is invalid"}), 403
+
+    source_event_id = str(event_payload.get("event_id") or "").strip()
+    try:
+        source_event_id = str(uuid.UUID(source_event_id))
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"success": False, "error": "A valid event_id is required"}), 400
     if not event_payload.get("name") and not event_payload.get("user_id"):
         return jsonify({"success": False, "error": "Missing employee identification"}), 400
 
-    org_id = event_payload.get("organization_id") or "ORG-001"
-    branch_id = event_payload.get("branch_id") or "BR-FORK-01"
+    org_id = branch_info["organization_id"]
+    branch_id = branch_info["branch_id"]
     event_payload["organization_id"] = org_id
     event_payload["branch_id"] = branch_id
+    event_payload["event_id"] = source_event_id
+    event_payload.pop("bypass_shift_check", None)
 
-    event_id = db.record_live_attendance_sync_event(event_payload)
+    current_hash = db._live_attendance_event_hash(event_payload)
+    previous_event = db.get_live_attendance_sync_event_by_source_id(source_event_id)
+    if previous_event and previous_event.get("payload_hash") != current_hash:
+        return jsonify({
+            "success": False,
+            "error": "event_id was already used with a different payload",
+        }), 409
 
-    # Ingest into PostgreSQL attendance_events table if cloud PostgreSQL is connected
-    if cloud_db:
-        try:
-            with cloud_db.tenant_context(org_id=org_id, branch_id=branch_id, is_platform_admin=True, enforce_rls=False) as cur:
-                ev_uid = str(event_payload.get("user_id") or "1")
-                # Look up or ensure employee exists in PostgreSQL
-                cur.execute("SELECT id FROM employees WHERE organization_id = %s AND (id = %s OR employee_code = %s);", (org_id, ev_uid, ev_uid))
-                emp_row = cur.fetchone()
-                emp_id = emp_row["id"] if emp_row else ev_uid
-                if not emp_row:
-                    cur.execute("""
-                        INSERT INTO employees (id, organization_id, branch_id, employee_code, name, is_active)
-                        VALUES (%s, %s, %s, %s, %s, TRUE)
-                        ON CONFLICT (organization_id, id) DO NOTHING;
-                    """, (emp_id, org_id, branch_id, ev_uid, event_payload.get("name", "Employee")))
+    local_result = query_local_dashboard(
+        "/api/attendance/edge-mark", method="POST", payload=event_payload
+    )
+    if not local_result.get("ok"):
+        logger.warning(
+            "Local attendance relay failed for event %s (HTTP %s): %s",
+            source_event_id,
+            local_result.get("status_code"),
+            local_result.get("error"),
+        )
+        relay_status = local_result.get("status_code")
+        if isinstance(relay_status, int) and 400 <= relay_status < 500:
+            return jsonify({
+                "success": False,
+                "event_id": source_event_id,
+                "error": "Local Dashboard rejected the attendance event",
+            }), relay_status
+        return jsonify({
+            "success": False,
+            "event_id": source_event_id,
+            "error": "Local Dashboard attendance relay is unavailable",
+        }), 502
 
-                cur.execute("""
-                    INSERT INTO attendance_events (
-                        id, organization_id, branch_id, employee_id, camera_id, timestamp, event_type, confidence, sync_status
-                    ) VALUES (%s, %s, %s, %s, %s, %s, 'CHECK_IN', %s, 'synced')
-                    ON CONFLICT (organization_id, id) DO NOTHING;
-                """, (
-                    f"EVT-{event_id or secrets.token_hex(6)}",
-                    org_id,
-                    branch_id,
-                    emp_id,
-                    event_payload.get("camera_id") or "edge_node",
-                    event_payload.get("timestamp") or datetime.now().isoformat(),
-                    float(event_payload.get("confidence") or 1.0)
-                ))
-        except Exception as pg_err:
-            logger_app = getattr(cloud_db, "logger", None)
-            if logger_app:
-                logger_app.warning("Could not persist attendance event to PG: %s", pg_err)
-
-    # Immediately relay to Local Dashboard so the client's Attendance Report updates in real-time
     try:
-        query_local_dashboard("/api/attendance/edge-mark", method="POST", payload=event_payload)
+        event_id, created, payload_matches = db.record_live_attendance_sync_event_once(
+            event_payload, source_event_id
+        )
     except Exception:
-        pass
+        logger.exception("Could not persist incoming attendance event.")
+        return jsonify({"success": False, "error": "Attendance event could not be persisted"}), 500
+    if not payload_matches:
+        return jsonify({
+            "success": False,
+            "error": "event_id was already used with a different payload",
+        }), 409
+
+    postgres_sync_status = "synced"
+    try:
+        _persist_attendance_event_to_postgres(
+            event_payload, source_event_id, org_id, branch_id
+        )
+    except Exception as pg_error:
+        try:
+            db.enqueue_attendance_postgres_sync(
+                source_event_id, org_id, branch_id, event_payload
+            )
+            _ensure_postgres_attendance_sync_worker()
+            postgres_sync_status = "pending"
+            logger.warning(
+                "PostgreSQL attendance replica for event %s is queued for retry: %s",
+                source_event_id,
+                pg_error,
+            )
+        except Exception:
+            logger.exception(
+                "PostgreSQL attendance sync queue could not persist event %s.",
+                source_event_id,
+            )
+            return jsonify({
+                "success": False,
+                "event_id": source_event_id,
+                "error": "Attendance was recorded locally, but cloud persistence could not be queued.",
+            }), 503
 
     return jsonify({
         "success": True,
-        "event_id": event_id,
-        "message": f"Attendance event for '{event_payload.get('name')}' synced to Cloud in real time",
+        "event_id": source_event_id,
+        "duplicate": not created,
+        "message": f"Attendance event for '{event_payload.get('name')}' accepted by Local Dashboard",
+        "postgres_sync_status": postgres_sync_status,
         "timestamp": event_payload.get("timestamp") or datetime.now().isoformat()
-    }), 201
+    }), 201 if created else 200
+
+
+@app.get("/api/edge/sync-state")
+def get_edge_sync_state():
+    """Return branch-bound attendance overrides for an authenticated edge node."""
+    branch_key = request.headers.get("X-Branch-Key", "").strip()
+    if not branch_key:
+        return jsonify({"success": False, "error": "Branch authentication required"}), 401
+
+    branch_info = db.get_branch_by_token_key(branch_key)
+    if not branch_info:
+        return jsonify({"success": False, "error": "Invalid branch credential"}), 401
+    if (
+        branch_info.get("organization_status") != "Active"
+        or branch_info.get("branch_access") != "Active"
+    ):
+        return jsonify({"success": False, "error": "Organization or branch is inactive"}), 403
+
+    expires_at = branch_info.get("token_expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            now = datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.now()
+            if expiry <= now:
+                return jsonify({"success": False, "error": "Branch credential has expired"}), 401
+        except ValueError:
+            logger.error("Invalid expiry timestamp for branch credential %s", branch_info.get("branch_id"))
+            return jsonify({"success": False, "error": "Branch credential configuration is invalid"}), 403
+
+    local_result = query_local_dashboard("/api/integration/edge-sync-state", method="GET")
+    if not local_result.get("ok"):
+        logger.warning(
+            "Could not retrieve branch attendance state from Local Dashboard (HTTP %s).",
+            local_result.get("status_code"),
+        )
+        return jsonify({
+            "success": False,
+            "error": "Attendance state is temporarily unavailable",
+        }), 502
+
+    local_state = local_result.get("data") or {}
+    organization_id = branch_info["organization_id"]
+    branch_id = branch_info["branch_id"]
+    if (
+        not local_state.get("success")
+        or local_state.get("organization_id") != organization_id
+        or local_state.get("branch_id") != branch_id
+        or not isinstance(local_state.get("manual_absent_user_ids"), list)
+    ):
+        logger.error("Local Dashboard attendance state did not match the authenticated edge branch.")
+        return jsonify({"success": False, "error": "Attendance state binding is invalid"}), 502
+
+    return jsonify({
+        "success": True,
+        "organization_id": organization_id,
+        "branch_id": branch_id,
+        "date": local_state.get("date"),
+        "manual_absent_user_ids": local_state["manual_absent_user_ids"],
+        "synced_at": datetime.now().isoformat(),
+    }), 200
 
 
 # ==============================================================================
@@ -1570,65 +1837,87 @@ def validate_edge_branch_key():
 @app.post("/api/client/authenticate")
 def client_authenticate():
     """
-    Public authentication endpoint for Client Portal logins.
-    Validates username/email and password against registered organizations and builds.
-    Returns organization profile, branch, and purchased modules snapshot.
+    Authenticate a provisioned client build or a branch activation key.
+    When both credentials and a branch key are supplied, they must identify the same branch.
     """
     data = request.get_json(silent=True) or {}
-    ident = (data.get("username") or data.get("email") or "").strip().lower()
-    password = (data.get("password") or "").strip()
-    branch_key = (data.get("branch_key") or "").strip().upper()
-
-    builds = db.get_all_builds()
-    orgs = db.get_all_organizations()
+    ident = str(data.get("username") or data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    branch_key = str(data.get("branch_key") or "").strip().upper()
+    if not isinstance(password, str):
+        return jsonify({"success": False, "error": "Password must be a string."}), 400
 
     matched_org = None
     matched_branch = None
-    matched_build = None
+    authenticated_build = None
+    if ident or password:
+        if not ident or not password:
+            return jsonify({"success": False, "error": "Username and password are both required."}), 400
+        authenticated_build = db.authenticate_client_build(ident, password)
+        if not authenticated_build:
+            return jsonify({"success": False, "error": "Invalid client credentials."}), 401
 
-    # 1. Match by branch_key if provided
-    if branch_key:
-        for o in orgs:
-            for b in o.get("branches", []):
-                t_key = (b.get("tokenKey") or b.get("token_key") or "").upper()
-                if t_key == branch_key:
-                    matched_org = o
-                    matched_branch = b
-                    break
-            if matched_org:
-                break
+        matched_org = db.get_organization_by_id(authenticated_build["organization_id"])
+        if matched_org:
+            matched_branch = next(
+                (branch for branch in matched_org.get("branches", [])
+                 if branch.get("id") == authenticated_build.get("branch_id")),
+                None,
+            )
+        if not matched_org or not matched_branch:
+            return jsonify({"success": False, "error": "Client build is not bound to a valid organization branch."}), 401
 
-    # 2. Match by build credentials
-    if not matched_org and ident:
-        for b in builds:
-            b_user = (b.get("clientUsername") or "").strip().lower()
-            b_pass = (b.get("clientPassword") or "").strip()
-            if b_user == ident and (not password or b_pass == password or password in ("Pass1234!", "admin123", "admin")):
-                matched_build = b
-                matched_org = next((o for o in orgs if o["id"] == b.get("organizationId")), None)
-                if matched_org:
-                    matched_branch = next((br for br in matched_org.get("branches", []) if br["id"] == b.get("branchId")), None)
-                break
+        configured_branch_key = str(
+            matched_branch.get("tokenKey") or matched_branch.get("token_key") or ""
+        ).strip().upper()
+        if branch_key and (
+            not configured_branch_key
+            or not secrets.compare_digest(branch_key, configured_branch_key)
+        ):
+            return jsonify({"success": False, "error": "Branch key does not match the authenticated client build."}), 401
+    elif branch_key:
+        branch_info = db.get_branch_by_token_key(branch_key)
+        if not branch_info:
+            return jsonify({"success": False, "error": "Invalid branch key."}), 401
+        matched_org = db.get_organization_by_id(branch_info["organization_id"])
+        if matched_org:
+            matched_branch = next(
+                (branch for branch in matched_org.get("branches", [])
+                 if branch.get("id") == branch_info.get("branch_id")),
+                None,
+            )
+        if not matched_org or not matched_branch:
+            return jsonify({"success": False, "error": "Branch is not bound to a valid organization."}), 401
+    else:
+        return jsonify({"success": False, "error": "Client credentials or a branch key are required."}), 400
 
-    # 3. Match by organization email or name
-    if not matched_org and ident:
-        for o in orgs:
-            o_email = (o.get("email") or "").strip().lower()
-            o_name = (o.get("name") or "").strip().lower()
-            clean_name_mail = f"admin@{o_name.replace(' ', '')}.com"
-            if o_email == ident or o_name == ident or clean_name_mail == ident:
-                if password in ("Pass1234!", "admin123", "admin"):
-                    matched_org = o
-                    matched_branch = o.get("branches", [])[0] if o.get("branches") else None
-                    break
+    if (
+        str(matched_org.get("status") or "").strip().lower() != "active"
+        or str(matched_branch.get("access") or "").strip().lower() != "active"
+    ):
+        return jsonify({"success": False, "error": "Organization or branch is inactive."}), 403
 
-    if not matched_org:
-        return jsonify({"success": False, "error": "Invalid client credentials."}), 401
+    token_expires_at = matched_branch.get("tokenExpiresAt") or matched_branch.get("token_expires_at")
+    if token_expires_at:
+        try:
+            if datetime.strptime(str(token_expires_at)[:10], "%Y-%m-%d").date() < datetime.now().date():
+                return jsonify({"success": False, "error": "Branch activation key has expired."}), 403
+        except ValueError:
+            logger.warning(
+                "Rejecting malformed branch key expiration for organization %s branch %s",
+                matched_org.get("id"),
+                matched_branch.get("id"),
+            )
+            return jsonify({"success": False, "error": "Branch activation key expiration is invalid."}), 403
 
     branch_name = matched_branch.get("name") if matched_branch else "Main Branch"
     branch_id = matched_branch.get("id") if matched_branch else "BR-01"
     b_key = (matched_branch.get("tokenKey") or matched_branch.get("token_key") or matched_org.get("tokenKey") or "") if matched_branch else (matched_org.get("tokenKey") or "")
-    modules = matched_org.get("modules", ["attendance", "shifts", "payroll"])
+    modules = (
+        authenticated_build.get("modules", [])
+        if authenticated_build
+        else matched_org.get("modules", [])
+    )
 
     return jsonify({
         "success": True,
@@ -1648,5 +1937,3 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     app.run(host=host, port=port, debug=debug)
-
-

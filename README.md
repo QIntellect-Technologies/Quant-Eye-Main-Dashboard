@@ -13,6 +13,10 @@ python app.py
 
 Open <http://127.0.0.1:5100>.
 
+When connecting this service to a Local Dashboard, configure `LOCAL_DASHBOARD_API_KEY` with the same private random value (at least 32 characters) on both services. Main-to-Local configuration synchronization fails closed if the key is missing or too short.
+
+For production, set `FLASK_SECRET_KEY` to a private random value of at least 32 characters, set `LOCAL_DASHBOARD_API_KEY` to a separate private random value of at least 32 characters, and configure `LOCAL_DASHBOARD_URL` with an HTTPS URL. Production startup fails closed when these secrets are missing or too short, or when the Local Dashboard URL is not HTTPS. HTTP is accepted only for localhost in explicit development/test mode. Never place runtime secrets in source files, `.env.example`, Client Node configs, or build artifacts.
+
 ## Frontend demo behavior
 
 - Organizations, branch configuration, branding, module selections, statuses, activity, invoices, payments, and build history persist in browser `localStorage`.

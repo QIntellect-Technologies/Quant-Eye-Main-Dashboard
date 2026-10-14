@@ -3,8 +3,11 @@ import os
 import uuid
 import json
 import logging
+import secrets
+import hashlib
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
+from werkzeug.security import check_password_hash, generate_password_hash
 
 logger = logging.getLogger("quanteye.main_db")
 
@@ -323,11 +326,38 @@ def init_db() -> bool:
                 synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS live_attendance_sync_event_receipts (
+                source_event_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                attendance_event_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attendance_postgres_sync_queue (
+                source_event_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                branch_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_attempt_at TIMESTAMP,
+                last_error TEXT,
+                synced_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
         # Explicit Indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_branch_cams ON branch_cameras(organization_id, branch_id);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sync_events_org ON live_attendance_sync_events(organization_id, branch_id);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sync_events_time ON live_attendance_sync_events(timestamp);')
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_attendance_pg_sync_due '
+            'ON attendance_postgres_sync_queue(status, next_attempt_at)'
+        )
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_org_status ON organizations(status);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_cpu_email ON control_plane_users(email);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_cpu_org ON control_plane_users(organization_id);')
@@ -427,6 +457,7 @@ def init_db() -> bool:
         # Organizations are now created exclusively through the UI or API.
         # This prevents deleted organizations from reappearing after a server restart.
 
+        _migrate_build_manifest_credentials(cursor)
         conn.commit()
 
     if _HAS_CLOUD_DB:
@@ -555,14 +586,16 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
 
         # License Token
         token_id = data.get('tokenId') or f"TOK-{org_id}"
-        token_key = data.get('tokenKey') or f"KEY-{org_id}-SECURE"
+        token_key = data.get('tokenKey') or f"QE-{secrets.token_hex(32).upper()}"
 
         # Default Branch if provided
         branches_data = data.get('branches', [])
+        branch_token_keys = {}
         if branches_data:
             for b in branches_data:
                 b_id = b.get('id', 'BR-01')
-                b_token = b.get('tokenKey') or b.get('branchKey') or f"KEY-{org_id}-{b_id}"
+                b_token = b.get('tokenKey') or b.get('branchKey') or f"QE-{secrets.token_hex(32).upper()}"
+                branch_token_keys[b_id] = b_token
                 cursor.execute('''
                     INSERT OR REPLACE INTO branches (id, organization_id, name, city, address, access, grace_days, employee_count, token_key, token_parent_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -576,10 +609,11 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             # Create standard default branch
             b_id = "BR-01"
+            branch_token_keys[b_id] = f"QE-{secrets.token_hex(32).upper()}"
             cursor.execute('''
                 INSERT INTO branches (id, organization_id, name, city, address, access, grace_days, employee_count, token_key, token_parent_id)
                 VALUES (?, ?, 'Main Branch', '', address, 'Active', 0, 0, ?, ?)
-            ''', (b_id, org_id, f"KEY-{org_id}-BR01", token_id))
+            ''', (b_id, org_id, branch_token_keys[b_id], token_id))
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         exp_str = (datetime.now(timezone.utc).replace(year=datetime.now().year + 1)).strftime("%Y-%m-%d")
         cursor.execute('''
@@ -614,13 +648,14 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
             )
             b_list = branches_data if branches_data else [{'id': 'BR-01', 'name': 'Main Branch', 'city': '', 'address': address}]
             for b in b_list:
+                b_id = b.get('id', 'BR-01')
                 cloud_db.create_branch(
                     org_id=org_id,
-                    branch_id=b.get('id', 'BR-01'),
+                    branch_id=b_id,
                     name=b.get('name', 'Main Branch'),
                     city=b.get('city', ''),
                     address=b.get('address', address),
-                    token_key=b.get('tokenKey') or f"KEY-{org_id}-{b.get('id', 'BR-01')}"
+                    token_key=branch_token_keys[b_id]
                 )
             for mid in selected_modules:
                 cloud_db.set_organization_module(org_id, mid, is_enabled=True)
@@ -970,11 +1005,68 @@ def get_all_builds() -> List[Dict[str, Any]]:
             b['branchName'] = b['branch_name']
             b['appName'] = b['app_name']
             b['clientPortalUrl'] = manifest.get('client_portal_url') or default_cloud_url
-            b['clientUsername'] = manifest.get('client_username') or f"admin@{b['organization_name'].lower().replace(' ', '')}.com"
-            b['clientPassword'] = manifest.get('client_password') or "Pass1234!"
-            b['branchKey'] = manifest.get('branch_key') or ""
+            b['clientUsername'] = manifest.get('client_username') or ""
+            b['clientPassword'] = ""
+            b['clientPasswordSet'] = bool(manifest.get('client_password_hash'))
+            b['branchKey'] = ""
             builds.append(b)
         return builds
+
+
+def _migrate_build_manifest_credentials(cursor: sqlite3.Cursor) -> None:
+    """Hash legacy build passwords and remove credentials from stored manifests."""
+    cursor.execute("SELECT id, download_manifest_json FROM application_builds WHERE download_manifest_json IS NOT NULL")
+    for build_id, raw_manifest in cursor.fetchall():
+        try:
+            manifest = json.loads(raw_manifest)
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed build manifest during credential migration: %s", build_id)
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        password = manifest.pop("client_password", None)
+        if password and not manifest.get("client_password_hash"):
+            manifest["client_password_hash"] = generate_password_hash(str(password))
+        manifest.pop("branch_key", None)
+        cursor.execute(
+            "UPDATE application_builds SET download_manifest_json = ? WHERE id = ?",
+            (json.dumps(manifest), build_id),
+        )
+
+
+def authenticate_client_build(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """Return a build's scope after verifying its stored password hash."""
+    clean_username = username.strip().lower()
+    if not clean_username or not password:
+        return None
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT id, organization_id, branch_id, modules_snapshot, download_manifest_json
+               FROM application_builds ORDER BY created_at DESC"""
+        )
+        for row in cursor.fetchall():
+            try:
+                manifest = json.loads(row["download_manifest_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            if str(manifest.get("client_username") or "").strip().lower() != clean_username:
+                continue
+            password_hash = manifest.get("client_password_hash")
+            if password_hash and check_password_hash(str(password_hash), password):
+                try:
+                    modules = json.loads(row["modules_snapshot"] or "[]")
+                except (TypeError, ValueError):
+                    modules = []
+                return {
+                    "id": row["id"],
+                    "organization_id": row["organization_id"],
+                    "branch_id": row["branch_id"],
+                    "modules": modules if isinstance(modules, list) else [],
+                }
+    return None
 
 def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new application build job with cloud URL and client credentials."""
@@ -1000,7 +1092,9 @@ def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
 
         client_portal_url = data.get('clientPortalUrl') or default_cloud_url
         client_username = data.get('clientUsername') or data.get('email') or f"admin@{org_name.lower().replace(' ', '')}.com"
-        client_password = data.get('clientPassword') or "Pass1234!"
+        client_password = str(data.get('clientPassword') or '').strip()
+        if len(client_password) < 14:
+            raise ValueError("Client password must contain at least 14 characters.")
 
         manifest_data = {
             "app_name": app_name,
@@ -1009,10 +1103,9 @@ def create_build(data: Dict[str, Any]) -> Dict[str, Any]:
             "organization_name": org_name,
             "branch_id": branch_id,
             "branch_name": branch_name,
-            "branch_key": branch_key,
             "client_portal_url": client_portal_url,
             "client_username": client_username,
-            "client_password": client_password,
+            "client_password_hash": generate_password_hash(client_password),
             "modules": modules_list,
             "created_at": datetime.now().isoformat()
         }
@@ -1284,82 +1377,41 @@ def update_user_last_login(user_id: str) -> bool:
         return True
 
 def ensure_default_users() -> None:
-    """Seed default platform_admin and organization_admin if none exist."""
-    from werkzeug.security import generate_password_hash
+    """Bootstrap administrator accounts only from explicitly configured credentials."""
+    bootstrap_users = (
+        ("PLATFORM_ADMIN_EMAIL", "PLATFORM_ADMIN_PASSWORD", "USR-PLATFORM-ADMIN", "Platform Administrator", "platform_admin", None),
+        ("ORGANIZATION_ADMIN_EMAIL", "ORGANIZATION_ADMIN_PASSWORD", "USR-ORG-ADMIN", "Organization Administrator", "organization_admin", os.environ.get("ORGANIZATION_ADMIN_ORG_ID")),
+    )
     with get_connection() as conn:
         cursor = conn.cursor()
-        # Platform Admin
-        cursor.execute("SELECT id FROM control_plane_users WHERE LOWER(email) = 'admin@qintellect.com'")
-        if not cursor.fetchone():
-            cursor.execute('''
-                INSERT INTO control_plane_users (id, name, email, password_hash, role, organization_id, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                "USR-PLATFORM-ADMIN",
-                "Platform Administrator",
-                "admin@qintellect.com",
-                generate_password_hash("admin123"),
-                "platform_admin",
-                None,
-                1
-            ))
-        # Organization Admin for Fork n Knives / Demo Org (ORG-001)
-        cursor.execute("SELECT id FROM control_plane_users WHERE LOWER(email) = 'admin@forknknives.com'")
-        if not cursor.fetchone():
-            cursor.execute('''
-                INSERT INTO control_plane_users (id, name, email, password_hash, role, organization_id, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                "USR-ORG-ADMIN-001",
-                "Fork n Knives Admin",
-                "admin@forknknives.com",
-                generate_password_hash("fork123"),
-                "organization_admin",
-                "ORG-001",
-                1
-            ))
-
-    if _HAS_CLOUD_DB:
-        try:
-            cloud_db.create_organization(
-                org_id="PLATFORM",
-                name="QIntellect Cloud Platform",
-                industry="Software",
-                email="admin@qintellect.com",
-                status="Active"
-            )
-            cloud_db.create_cloud_user(
-                organization_id="PLATFORM",
-                username="admin_qintellect",
-                email="admin@qintellect.com",
-                password="admin123",
-                role="platform_admin",
-                user_id="USR-PLATFORM-ADMIN"
-            )
-            # Ensure ORG-001 exists in PostgreSQL
-            cloud_db.create_organization(
-                org_id="ORG-001",
-                name="Demo Organization",
-                industry="Technology",
-                email="contact@demo-org.com",
-                status="Active"
-            )
-            cloud_db.create_branch(
-                org_id="ORG-001",
-                branch_id="BR-ORG-001",
-                name="Main Branch"
-            )
-            cloud_db.create_cloud_user(
-                organization_id="ORG-001",
-                username="fork_admin",
-                email="admin@forknknives.com",
-                password="fork123",
-                role="org_admin",
-                user_id="USR-ORG-ADMIN-001"
-            )
-        except Exception as e:
-            logger.warning("cloud_db error during ensure_default_users: %s", e)
-
+        configured_emails = []
+        for email_env, password_env, user_id, name, role, organization_id in bootstrap_users:
+            email = os.environ.get(email_env, "").strip().lower()
+            password = os.environ.get(password_env, "")
+            if bool(email) != bool(password):
+                raise ValueError(f"Both {email_env} and {password_env} must be configured together.")
+            if role == "organization_admin" and email and not organization_id:
+                raise ValueError("ORGANIZATION_ADMIN_ORG_ID is required with organization admin credentials.")
+            if not email:
+                continue
+            configured_emails.append(email)
+            cursor.execute("SELECT id FROM control_plane_users WHERE LOWER(email) = ?", (email,))
+            existing = cursor.fetchone()
+            password_hash = generate_password_hash(password)
+            if existing:
+                cursor.execute(
+                    "UPDATE control_plane_users SET password_hash = ?, role = ?, organization_id = ?, active = 1 WHERE id = ?",
+                    (password_hash, role, organization_id, existing["id"]),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO control_plane_users (id, name, email, password_hash, role, organization_id, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    (user_id, name, email, password_hash, role, organization_id),
+                )
+        for email in ("admin@qintellect.com", "admin@forknknives.com"):
+            if email not in configured_emails:
+                cursor.execute("UPDATE control_plane_users SET active = 0 WHERE LOWER(email) = ?", (email,))
+        conn.commit()
 def get_branch_cameras(organization_id: str, branch_id: str) -> List[Dict[str, Any]]:
     """Retrieve all configured cameras for a branch."""
     with get_connection() as conn:
@@ -1421,6 +1473,136 @@ def record_live_attendance_sync_event(event_data: Dict[str, Any]) -> int:
         conn.commit()
         return cursor.lastrowid
 
+
+def _live_attendance_event_hash(event_data: Dict[str, Any]) -> str:
+    hashed_payload = {
+        key: value for key, value in event_data.items() if key != "event_id"
+    }
+    return hashlib.sha256(
+        json.dumps(
+            hashed_payload, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def get_live_attendance_sync_event_by_source_id(source_event_id: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT attendance_event_id AS id, payload_hash "
+            "FROM live_attendance_sync_event_receipts WHERE source_event_id = ?",
+            (source_event_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_live_attendance_sync_event_once(
+    event_data: Dict[str, Any],
+    source_event_id: str,
+) -> Tuple[int, bool, bool]:
+    """Persist a client event once and detect reuse of its ID with changed data."""
+    payload_hash = _live_attendance_event_hash(event_data)
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        existing = cursor.execute(
+            "SELECT attendance_event_id, payload_hash "
+            "FROM live_attendance_sync_event_receipts WHERE source_event_id = ?",
+            (source_event_id,),
+        ).fetchone()
+        if existing:
+            conn.commit()
+            return int(existing["attendance_event_id"]), False, existing["payload_hash"] == payload_hash
+
+        cursor.execute('''
+            INSERT INTO live_attendance_sync_events (
+                organization_id, branch_id, camera_id, camera_name,
+                user_id, name, confidence, status, source, face_crop_base64, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            event_data.get('organization_id'),
+            event_data.get('branch_id'),
+            event_data.get('camera_id'),
+            event_data.get('camera_name'),
+            event_data.get('user_id'),
+            event_data.get('name', 'Unknown'),
+            event_data.get('confidence'),
+            event_data.get('status', 'Present'),
+            event_data.get('source', 'ai_camera'),
+            event_data.get('face_crop_base64'),
+            event_data.get('timestamp') or datetime.now().isoformat(),
+        ))
+        event_id = int(cursor.lastrowid)
+        cursor.execute(
+            "INSERT INTO live_attendance_sync_event_receipts "
+            "(source_event_id, payload_hash, attendance_event_id) VALUES (?, ?, ?)",
+            (source_event_id, payload_hash, event_id),
+        )
+        conn.commit()
+        return event_id, True, True
+
+
+def enqueue_attendance_postgres_sync(
+    event_id: str,
+    organization_id: str,
+    branch_id: str,
+    payload: Dict[str, Any],
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO attendance_postgres_sync_queue
+               (source_event_id, organization_id, branch_id, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            (
+                event_id,
+                organization_id,
+                branch_id,
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            ),
+        )
+        conn.commit()
+
+
+def get_due_attendance_postgres_sync(limit: int = 25) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT source_event_id, organization_id, branch_id, payload_json, attempts
+               FROM attendance_postgres_sync_queue
+               WHERE status = 'pending'
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now', 'localtime'))
+               ORDER BY created_at, source_event_id
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def mark_attendance_postgres_sync_succeeded(event_id: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE attendance_postgres_sync_queue
+               SET status = 'synced', synced_at = CURRENT_TIMESTAMP,
+                   last_attempt_at = CURRENT_TIMESTAMP, last_error = NULL
+               WHERE source_event_id = ?""",
+            (event_id,),
+        )
+        conn.commit()
+
+
+def mark_attendance_postgres_sync_failed(event_id: str, error: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE attendance_postgres_sync_queue
+               SET attempts = attempts + 1,
+                   next_attempt_at = datetime(
+                       'now', 'localtime',
+                       '+' || MIN(300, (2 << MIN(attempts, 7))) || ' seconds'
+                   ),
+                   last_attempt_at = CURRENT_TIMESTAMP, last_error = ?
+               WHERE source_event_id = ? AND status = 'pending'""",
+            (error[:500], event_id),
+        )
+        conn.commit()
+
 def get_live_attendance_sync_events(organization_id: str, branch_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """Retrieve recent live attendance events for an organization."""
     with get_connection() as conn:
@@ -1469,4 +1651,3 @@ if __name__ == "__main__":
     init_db()
     ensure_default_users()
     print("✓ QuantEye-Main-Dashboard database.py initialized successfully.")
-
