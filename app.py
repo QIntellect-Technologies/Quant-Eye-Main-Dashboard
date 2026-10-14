@@ -2118,6 +2118,19 @@ def client_authenticate():
     }), 200
 
 
+@app.post("/api/client/verify-enrollment-key")
+def client_verify_enrollment_key():
+    """Confirm the Staff Enrollment key for one organization. Does not return the stored key."""
+    data = request.get_json(silent=True) or {}
+    org_id = str(data.get("organization_id") or "").strip()
+    provided = str(data.get("enrollment_key") or data.get("enrollmentKey") or "").strip()
+    if not org_id or not provided:
+        return jsonify({"success": False, "error": "Organization and enrollment key are required."}), 400
+    if not db.verify_enrollment_key(org_id, provided):
+        return jsonify({"success": False, "error": "Invalid staff enrollment key."}), 401
+    return jsonify({"success": True, "organization_id": org_id}), 200
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5100"))
     host = os.environ.get("HOST", "0.0.0.0")

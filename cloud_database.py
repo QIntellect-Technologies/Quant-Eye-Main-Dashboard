@@ -275,6 +275,31 @@ def ensure_portal_slug_column() -> None:
         conn.close()
 
 
+def ensure_enrollment_key_column() -> None:
+    """Add enrollment_key and backfill missing values on live Postgres."""
+    if not postgres_is_configured():
+        return
+    import secrets as _secrets
+    conn = get_raw_connection()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS enrollment_key VARCHAR(80);")
+            cur.execute("SELECT id FROM organizations WHERE enrollment_key IS NULL OR enrollment_key = '';")
+            missing = cur.fetchall() or []
+            for row in missing:
+                org_id = row["id"] if isinstance(row, dict) else row[0]
+                cur.execute(
+                    "UPDATE organizations SET enrollment_key = %s WHERE id = %s AND (enrollment_key IS NULL OR enrollment_key = '');",
+                    (f"ENR-{_secrets.token_hex(10).upper()}", org_id),
+                )
+        logger.info("Ensured organizations.enrollment_key exists.")
+    except Exception as error:
+        logger.warning("Could not ensure enrollment_key yet: %s", error)
+    finally:
+        conn.close()
+
+
 def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
     """Initialize cloud schema using superuser/admin connection."""
     if not postgres_is_configured():
@@ -296,6 +321,7 @@ def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
             cur.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_portal_slug ON organizations(portal_slug);"
             )
+            cur.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS enrollment_key VARCHAR(80);")
             try:
                 cur.execute(ddl)
             except Exception as ddl_error:
@@ -427,19 +453,23 @@ def create_organization(
     address: str = "",
     status: str = "Active",
     portal_slug: Optional[str] = None,
+    enrollment_key: Optional[str] = None,
     user_context: Optional[CloudUser] = None
 ) -> Dict[str, Any]:
     from tenant_urls import make_portal_slug
+    import secrets as _secrets
     # Creating an organization is typically platform_admin or onboarding
     is_plat = user_context.is_platform_admin if user_context else True
     slug = portal_slug or make_portal_slug(name, org_id)
+    enroll_key = enrollment_key or f"ENR-{_secrets.token_hex(10).upper()}"
     with tenant_context(user=user_context, org_id=org_id, is_platform_admin=is_plat, enforce_rls=False) as cur:
         cur.execute("""
-            INSERT INTO organizations (id, name, portal_slug, industry, email, phone, address, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO organizations (id, name, portal_slug, enrollment_key, industry, email, phone, address, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 portal_slug = EXCLUDED.portal_slug,
+                enrollment_key = COALESCE(organizations.enrollment_key, EXCLUDED.enrollment_key),
                 industry = EXCLUDED.industry,
                 email = EXCLUDED.email,
                 phone = EXCLUDED.phone,
@@ -447,7 +477,7 @@ def create_organization(
                 status = EXCLUDED.status,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *;
-        """, (org_id, name, slug, industry, email, phone, address, status))
+        """, (org_id, name, slug, enroll_key, industry, email, phone, address, status))
         row = cur.fetchone()
         return dict(row)
 

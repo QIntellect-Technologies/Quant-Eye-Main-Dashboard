@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
     portal_slug VARCHAR(80) UNIQUE,
+    enrollment_key VARCHAR(80),
     industry VARCHAR(100) DEFAULT 'Technology',
     email VARCHAR(255),
     phone VARCHAR(50),

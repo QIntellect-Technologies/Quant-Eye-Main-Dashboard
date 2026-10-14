@@ -31,6 +31,11 @@ def _resolve_db_path() -> str:
 
 DB_PATH = _resolve_db_path()
 
+
+def new_enrollment_key() -> str:
+    """Client Settings key that enables Staff Enrollment. Not an EXE branch key."""
+    return f"ENR-{secrets.token_hex(10).upper()}"
+
 def get_connection() -> sqlite3.Connection:
     """Return a SQLite connection with foreign keys enabled and row factory configured."""
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
@@ -60,6 +65,7 @@ def init_db() -> bool:
                 address TEXT,
                 status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active', 'Build Pending', 'Inactive', 'Suspended')),
                 portal_slug TEXT UNIQUE,
+                enrollment_key TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -470,16 +476,30 @@ def init_db() -> bool:
                 continue
             slug = make_portal_slug(row["name"], row["id"])
             cursor.execute("UPDATE organizations SET portal_slug = ? WHERE id = ?", (slug, row["id"]))
+        try:
+            cursor.execute("ALTER TABLE organizations ADD COLUMN enrollment_key TEXT")
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute("SELECT id, enrollment_key FROM organizations")
+        for row in cursor.fetchall():
+            if str(row["enrollment_key"] or "").strip():
+                continue
+            cursor.execute(
+                "UPDATE organizations SET enrollment_key = ? WHERE id = ?",
+                (new_enrollment_key(), row["id"]),
+            )
         conn.commit()
 
     if _HAS_CLOUD_DB and cloud_db.postgres_is_configured():
         try:
             cloud_db.ensure_portal_slug_column()
+            cloud_db.ensure_enrollment_key_column()
             cloud_db.init_cloud_db()
         except Exception as e:
             logger.warning("cloud_db init failed during init_db: %s", e)
             try:
                 cloud_db.ensure_portal_slug_column()
+                cloud_db.ensure_enrollment_key_column()
             except Exception as migrate_error:
                 logger.warning("portal_slug migration failed: %s", migrate_error)
     elif _HAS_CLOUD_DB:
@@ -507,9 +527,21 @@ def _decorate_organization_urls(org_dict: Dict[str, Any]) -> Dict[str, Any]:
     org_dict["createdAt"] = org_dict.get("createdAt") or org_dict.get("created_at") or ""
     org_dict["updatedAt"] = org_dict.get("updatedAt") or org_dict.get("updated_at") or ""
     org_dict["tokenKey"] = org_dict.get("tokenKey") or org_dict.get("token_key") or ""
+    enrollment_key = str(org_dict.get("enrollmentKey") or org_dict.get("enrollment_key") or "").strip()
+    org_dict["enrollment_key"] = enrollment_key
+    org_dict["enrollmentKey"] = enrollment_key
     if not isinstance(org_dict.get("modules"), list):
         org_dict["modules"] = []
     return org_dict
+
+
+def verify_enrollment_key(organization_id: str, provided_key: str) -> bool:
+    org = get_organization_by_id(organization_id)
+    stored = str((org or {}).get("enrollmentKey") or "").strip()
+    offered = str(provided_key or "").strip()
+    if not stored or not offered:
+        return False
+    return secrets.compare_digest(stored.upper(), offered.upper())
 
 
 def _organization_from_postgres(org_id: str) -> Optional[Dict[str, Any]]:
@@ -650,10 +682,11 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
         status = data.get('status', 'Active')
 
         portal_slug = make_portal_slug(name, org_id)
+        enrollment_key = data.get("enrollmentKey") or data.get("enrollment_key") or new_enrollment_key()
         cursor.execute('''
-            INSERT INTO organizations (id, name, industry, email, phone, address, status, portal_slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (org_id, name, industry, email, phone, address, status, portal_slug))
+            INSERT INTO organizations (id, name, industry, email, phone, address, status, portal_slug, enrollment_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (org_id, name, industry, email, phone, address, status, portal_slug, enrollment_key))
 
         # Organization Modules
         selected_modules = data.get('modules') or ['attendance', 'employees']
@@ -736,6 +769,7 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
                 address=address,
                 status=status,
                 portal_slug=portal_slug,
+                enrollment_key=enrollment_key,
             )
             b_list = branches_data if branches_data else [{'id': 'BR-01', 'name': 'Main Branch', 'city': '', 'address': address}]
             for b in b_list:

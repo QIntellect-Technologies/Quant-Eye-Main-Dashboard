@@ -362,6 +362,24 @@ class TestMainDashboardRegression(unittest.TestCase):
         finally:
             db.delete_build(build_id)
 
+    def test_organization_issues_staff_enrollment_key(self):
+        org = db.create_organization({
+            "id": f"ORG-ENR-{uuid.uuid4().hex[:8]}",
+            "name": f"Enrollment Key Org {uuid.uuid4().hex[:6]}",
+            "branches": [{"id": "BR-ENR", "name": "Main"}],
+        })
+        self.assertTrue(str(org.get("enrollmentKey") or "").startswith("ENR-"))
+        ok = self.client.post("/api/client/verify-enrollment-key", json={
+            "organization_id": org["id"],
+            "enrollment_key": org["enrollmentKey"],
+        })
+        self.assertEqual(ok.status_code, 200)
+        bad = self.client.post("/api/client/verify-enrollment-key", json={
+            "organization_id": org["id"],
+            "enrollment_key": "ENR-WRONG",
+        })
+        self.assertEqual(bad.status_code, 401)
+
     def test_delete_organization_removes_associated_build_history(self):
         org_id = f"ORG-DELETE-{uuid.uuid4().hex[:8]}"
         org = db.create_organization({
@@ -550,6 +568,8 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertIn(b"function resolveClientPortalUrl", response.data)
         self.assertIn(b"not Main Dashboard", response.data)
         self.assertIn(b"EXE BRANCH KEY", response.data)
+        self.assertIn(b"STAFF ENROLLMENT KEY", response.data)
+        self.assertIn(b"four items only", response.data)
 
     def test_attendance_relay_requires_branch_key_and_is_idempotent(self):
         organization = db.get_organization_by_id("ORG-001")
