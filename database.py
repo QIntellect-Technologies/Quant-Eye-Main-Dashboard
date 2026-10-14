@@ -504,6 +504,11 @@ def _decorate_organization_urls(org_dict: Dict[str, Any]) -> Dict[str, Any]:
     org_dict["portalSlug"] = slug
     org_dict["clientPortalUrl"] = company_portal_url(name, org_id, slug)
     org_dict["client_portal_url"] = org_dict["clientPortalUrl"]
+    org_dict["createdAt"] = org_dict.get("createdAt") or org_dict.get("created_at") or ""
+    org_dict["updatedAt"] = org_dict.get("updatedAt") or org_dict.get("updated_at") or ""
+    org_dict["tokenKey"] = org_dict.get("tokenKey") or org_dict.get("token_key") or ""
+    if not isinstance(org_dict.get("modules"), list):
+        org_dict["modules"] = []
     return org_dict
 
 

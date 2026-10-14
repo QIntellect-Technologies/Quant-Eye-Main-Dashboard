@@ -926,40 +926,12 @@ def log_activity():
 @app.post("/api/sync-localstorage")
 @require_auth(allowed_roles=['platform_admin'])
 def sync_localstorage():
-    """Import existing browser localStorage data if dashboard.db only has default seed."""
-    payload = request.get_json(silent=True) or {}
-    imported = {"organizations": 0, "builds": 0, "invoices": 0}
-    try:
-        # Import orgs if provided
-        client_orgs = payload.get("organizations", [])
-        if client_orgs:
-            for co in client_orgs:
-                existing = db.get_organization_by_id(co.get("id"))
-                if not existing and co.get("name"):
-                    db.create_organization(co)
-                    imported["organizations"] += 1
-                elif existing:
-                    db.update_organization(co["id"], co)
-
-        # Import builds if provided
-        client_builds = payload.get("builds", [])
-        existing_builds = {b["id"] for b in db.get_all_builds()}
-        for cb in client_builds:
-            if cb.get("id") not in existing_builds:
-                db.create_build(cb)
-                imported["builds"] += 1
-
-        # Import invoices if provided
-        client_invoices = payload.get("invoices", [])
-        existing_invoices = {inv["id"] for inv in db.get_all_invoices()}
-        for ci in client_invoices:
-            if ci.get("id") not in existing_invoices:
-                db.create_invoice(ci)
-                imported["invoices"] += 1
-
-        return jsonify({"success": True, "imported": imported})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    """Browser localStorage is not a tenant source. Do not recreate deleted organizations."""
+    return jsonify({
+        "success": True,
+        "imported": {"organizations": 0, "builds": 0, "invoices": 0},
+        "ignored": True,
+    })
 
 
 # ==============================================================================

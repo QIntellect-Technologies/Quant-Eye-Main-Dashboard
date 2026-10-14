@@ -343,6 +343,12 @@
     }
     function load(key,fallback){try{const value=JSON.parse(localStorage.getItem(key));return value??fallback}catch{return fallback}}
     function save(){/* Legacy no-op: persistence handled via backend APIs */}
+    async function checkLocalStorageMigration(){
+      localStorage.removeItem(STORE.orgs);
+      localStorage.removeItem(STORE.builds);
+      localStorage.removeItem(STORE.invoices);
+      localStorage.removeItem(STORE.activity);
+    }
     async function reloadData(){
       try{
         const [orgs,blds,invs,acts]=await Promise.all([
@@ -360,31 +366,6 @@
         render();
       }catch(e){
         console.error("Backend fetch error:",e);
-      }
-    }
-    async function checkLocalStorageMigration(){
-      const localOrgs=load(STORE.orgs,null),localBuilds=load(STORE.builds,null),localInvoices=load(STORE.invoices,null);
-      if(localOrgs&&Array.isArray(localOrgs)&&localOrgs.length>0){
-        try{
-          const res=await fetch("/api/sync-localstorage",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({organizations:localOrgs,builds:localBuilds||[],invoices:localInvoices||[]})
-          });
-          if(res.ok){
-            const result=await res.json();
-            // Verify database records actually exist before removing localStorage
-            const verifyOrgs=await fetch("/api/organizations").then(r=>r.json());
-            if(Array.isArray(verifyOrgs)&&verifyOrgs.length>=localOrgs.length){
-              localStorage.removeItem(STORE.orgs);
-              localStorage.removeItem(STORE.builds);
-              localStorage.removeItem(STORE.invoices);
-              localStorage.removeItem(STORE.activity);
-            }
-          }
-        }catch(e){
-          console.warn("Migration notice:",e);
-        }
       }
     }
     function esc(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -433,21 +414,41 @@
     function createToken(){return "QE-"+crypto.randomUUID().replaceAll("-","").slice(0,20).toUpperCase()}
     function createBranchId(){return "BR-"+crypto.randomUUID().replaceAll("-","").slice(0,16).toUpperCase()}
     function createOrganizationKeyId(){return "ORGKEY-"+crypto.randomUUID().replaceAll("-","").slice(0,16).toUpperCase()}
-    function normalizeOrg(org){if(!org.tokenId||org.tokenId.startsWith("BR-"))org.tokenId=createOrganizationKeyId();if(org.tokenStartedAt===undefined)org.tokenStartedAt="";if(org.tokenExpiresAt===undefined)org.tokenExpiresAt="";if(org.tokenValidityDays===undefined)org.tokenValidityDays=30;org.branches=org.branches&&org.branches.length?org.branches:([{name:"Main Branch",city:"",address:"",access:"Active",graceDays:7,employeeCount:0}]);org.branches.forEach(branch=>{if(!branch.id)branch.id=createBranchId();if(!branch.access)branch.access="Active";if(branch.graceDays===undefined)branch.graceDays=7;if(branch.employeeCount===undefined)branch.employeeCount=branch.unlistedEmployeeCount??(Array.isArray(branch.employees)?branch.employees.length:0);branch.employeeCount=Math.max(0,Number(branch.employeeCount)||0);delete branch.employees;delete branch.unlistedEmployeeCount;if(!branch.tokenKey)branch.tokenKey=createToken();branch.tokenParentId=org.tokenId;branch.tokenStartedAt=org.tokenStartedAt;branch.tokenExpiresAt=org.tokenExpiresAt});org.branding=org.branding||{logo:"",appTitle:org.name+" Application"};if(!org.tokenKey)org.tokenKey=createToken();if(org.employeeCount===undefined)org.employeeCount=org.branches.reduce((sum,branch)=>sum+Number(branch.employeeCount||0),0);return org}
+    function normalizeOrg(org){
+      if(!Array.isArray(org.modules))org.modules=[];
+      if(!org.createdAt)org.createdAt=org.created_at||"";
+      if(!org.updatedAt)org.updatedAt=org.updated_at||"";
+      if(!org.tokenId||org.tokenId.startsWith("BR-"))org.tokenId=org.token_id||createOrganizationKeyId();
+      if(org.tokenStartedAt===undefined)org.tokenStartedAt=org.token_started_at||"";
+      if(org.tokenExpiresAt===undefined)org.tokenExpiresAt=org.token_expires_at||"";
+      if(org.tokenValidityDays===undefined)org.tokenValidityDays=30;
+      org.tokenKey=org.tokenKey||org.token_key||"";
+      org.portalSlug=org.portalSlug||org.portal_slug||"";
+      org.clientPortalUrl=org.clientPortalUrl||org.client_portal_url||"";
+      org.branches=org.branches&&org.branches.length?org.branches:([{name:"Main Branch",city:"",address:"",access:"Active",graceDays:7,employeeCount:0}]);
+      org.branches.forEach(branch=>{
+        if(!branch.id)branch.id=branch.branch_id||createBranchId();
+        if(!branch.access)branch.access="Active";
+        if(branch.graceDays===undefined)branch.graceDays=branch.grace_days||7;
+        if(branch.employeeCount===undefined)branch.employeeCount=branch.employee_count??branch.unlistedEmployeeCount??(Array.isArray(branch.employees)?branch.employees.length:0);
+        branch.employeeCount=Math.max(0,Number(branch.employeeCount)||0);
+        delete branch.employees;
+        delete branch.unlistedEmployeeCount;
+        branch.tokenKey=branch.tokenKey||branch.token_key||"";
+        branch.tokenParentId=org.tokenId;
+        branch.tokenStartedAt=org.tokenStartedAt;
+        branch.tokenExpiresAt=org.tokenExpiresAt;
+      });
+      org.branding=org.branding||{logo:"",appTitle:org.name+" Application"};
+      if(org.employeeCount===undefined)org.employeeCount=org.branches.reduce((sum,branch)=>sum+Number(branch.employeeCount||0),0);
+      return org;
+    }
     organizations.forEach(normalizeOrg);normalizeBuildHistory();save();
     function stats(){
       document.getElementById("statOrganizations").textContent=organizations.length;
-      document.getElementById("statActive").textContent=organizations.filter(org=>org.status==="Active").length;
+      document.getElementById("statActive").textContent=organizations.filter(org=>String(org.status||"")==="Active").length;
       document.getElementById("statModules").textContent=MODULES.length;
       document.getElementById("statBuilds").textContent=builds.length;
-      fetch("/api/dashboard/stats").then(r=>r.json()).then(data=>{
-        if(data && data.success && data.stats){
-          if(data.stats.organizations_total !== undefined) document.getElementById("statOrganizations").textContent = data.stats.organizations_total;
-          if(data.stats.organizations_active !== undefined) document.getElementById("statActive").textContent = data.stats.organizations_active;
-          if(data.stats.modules_total !== undefined) document.getElementById("statModules").textContent = data.stats.modules_total;
-          if(data.stats.builds_total !== undefined) document.getElementById("statBuilds").textContent = data.stats.builds_total;
-        }
-      }).catch(()=>{});
     }
     let selectedOrganizationId="", pendingDeleteOrganizationId="";
     function showPage(page){currentPage=page;document.querySelectorAll(".section").forEach(section=>section.hidden=section.id!==page);document.querySelectorAll("[data-page]").forEach(button=>button.classList.toggle("active",button.dataset.page===page));document.getElementById("pageTitle").textContent=page==="overview"?"Main Dashboard":page==="modules"?"Module Catalog":page==="builds"?"Application Builds":page==="organization-build-history"?"Organization Build History":page==="invoices"?"Invoices & Payments":page==="branding"?"Application Branding":page==="organization-detail"?"Organization Details":"Organizations";if(document.body.classList.contains("dashboard-open"))localStorage.setItem(STORE.portal,JSON.stringify({product:"quanteye",page,organizationId:selectedOrganizationId,buildHistoryOrganizationId:selectedBuildHistoryOrg}));render();window.scrollTo({top:0,behavior:"smooth"})}
@@ -1328,13 +1329,7 @@ ${((org&&org.modules)||build.modules||[]).map(moduleName).join(", ")}
         if(dot&&txt){
           if(data.connected){
             dot.style.background="#238b86"; // success teal
-            let msg="Local Dashboard: Connected";
-            if(data.linked&&data.branch_name){
-              msg+=` (${data.branch_name} • ${data.licensed_modules?.length||0}/8 modules)`;
-            }else if(!data.linked){
-              msg+=" (Not Linked)";
-            }
-            txt.textContent=msg;
+            txt.textContent="Client portal: reachable";
           }else{
             dot.style.background="#c55252"; // danger red
             txt.textContent="Local Dashboard: Disconnected";
