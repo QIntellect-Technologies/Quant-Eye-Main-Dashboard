@@ -947,7 +947,7 @@ def query_local_dashboard(endpoint, method="GET", payload=None):
         "/api/integration/cameras",
         "/api/integration/employees",
         "/api/attendance/edge-mark",
-    }:
+    } or endpoint_path.startswith("/api/integration/employees/"):
         integration_key = os.environ.get("LOCAL_DASHBOARD_API_KEY", "").strip()
         if len(integration_key) < 32:
             return {
@@ -1496,6 +1496,61 @@ def get_edge_sync_state():
         "manual_absent_user_ids": local_state["manual_absent_user_ids"],
         "synced_at": datetime.now().isoformat(),
     }), 200
+
+
+@app.post("/api/edge/branches/<branch_id>/employees/<int:user_id>/embeddings")
+def sync_edge_employee_embeddings(branch_id, user_id):
+    """Relay a trained branch employee's face embeddings to the Client Portal."""
+    branch_key = request.headers.get("X-Branch-Key", "").strip()
+    if not branch_key:
+        return jsonify({"success": False, "error": "Branch authentication required"}), 401
+
+    branch_info = db.get_branch_by_token_key(branch_key)
+    if not branch_info or str(branch_info.get("branch_id")) != str(branch_id):
+        return jsonify({"success": False, "error": "Invalid branch credential"}), 401
+    if (
+        branch_info.get("organization_status") != "Active"
+        or branch_info.get("branch_access") != "Active"
+    ):
+        return jsonify({"success": False, "error": "Organization or branch is inactive"}), 403
+
+    expires_at = branch_info.get("token_expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            now = datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.now()
+            if expiry <= now:
+                return jsonify({"success": False, "error": "Branch credential has expired"}), 401
+        except ValueError:
+            logger.error("Invalid expiry timestamp for branch credential %s", branch_id)
+            return jsonify({"success": False, "error": "Branch credential configuration is invalid"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    relay_path = (
+        f"/api/integration/employees/{user_id}/embeddings"
+        f"?organization_id={branch_info['organization_id']}&branch_id={branch_id}"
+    )
+    result = query_local_dashboard(relay_path, method="POST", payload=payload)
+    if not result.get("ok"):
+        logger.warning(
+            "Client Portal rejected face embedding sync for employee %s in branch %s (HTTP %s).",
+            user_id,
+            branch_id,
+            result.get("status_code"),
+        )
+        status = result.get("status_code")
+        return jsonify({
+            "success": False,
+            "error": "Client Portal biometric synchronization is temporarily unavailable.",
+        }), status if isinstance(status, int) and 400 <= status < 500 else 502
+
+    response = result.get("data") or {}
+    if response.get("success") is not True:
+        return jsonify({
+            "success": False,
+            "error": "Client Portal did not confirm biometric synchronization.",
+        }), 502
+    return jsonify(response), 200
 
 
 # ==============================================================================
