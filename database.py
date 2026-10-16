@@ -388,10 +388,10 @@ def init_db() -> bool:
             ("overtime", "Overtime Management", "fa-clock", "Track overtime hours, policies, and approvals.", 0, 3),
             ("leave", "Leave Management", "fa-plane-departure", "Handle leave balances, requests, and approvals.", 0, 4),
             ("payroll", "Payroll Management", "fa-money-check-dollar", "Automated payroll processing based on attendance.", 0, 5),
+            ("mobile", "Mobile App", "fa-mobile-screen", "One phone page where each employee sees only their own attendance.", 0, 6),
         ]
-        # Clean up any non-commercial modules
-        cursor.execute("DELETE FROM module_catalog WHERE id NOT IN ('attendance', 'shifts', 'overtime', 'leave', 'payroll')")
-        cursor.execute("DELETE FROM organization_modules WHERE module_id NOT IN ('attendance', 'shifts', 'overtime', 'leave', 'payroll')")
+        cursor.execute("DELETE FROM module_catalog WHERE id NOT IN ('attendance', 'shifts', 'overtime', 'leave', 'payroll', 'mobile')")
+        cursor.execute("DELETE FROM organization_modules WHERE module_id NOT IN ('attendance', 'shifts', 'overtime', 'leave', 'payroll', 'mobile')")
 
         cursor.executemany('''
             INSERT INTO module_catalog (id, name, icon, description, required, sort_order)

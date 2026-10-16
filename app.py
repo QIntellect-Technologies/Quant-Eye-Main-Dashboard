@@ -529,6 +529,18 @@ def api_dashboard_stats():
 # MODULE CATALOG
 # ==============================================================================
 
+@app.get("/api/public/mobile-module/<org_id>")
+def public_mobile_module(org_id):
+    """Tell the employee phone page whether this organization bought Mobile App."""
+    try:
+        org = db.get_organization_by_id(str(org_id or "").strip())
+    except Exception:
+        logger.exception("Mobile module lookup failed")
+        return jsonify({"mobile": False}), 200
+    modules = [str(module).strip().lower() for module in ((org or {}).get("modules") or [])]
+    return jsonify({"mobile": "mobile" in modules})
+
+
 @app.get("/api/modules")
 @require_auth()
 def list_modules():

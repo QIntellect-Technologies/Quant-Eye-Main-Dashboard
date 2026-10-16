@@ -341,6 +341,7 @@ def seed_modules(conn):
         ("overtime", "Overtime Management", "Track overtime hours, policies, and approvals.", "core", True),
         ("leave", "Leave Management", "Handle leave balances, requests, and approvals.", "core", True),
         ("payroll", "Payroll Management", "Automated payroll processing based on attendance.", "core", True),
+        ("mobile", "Mobile App", "One phone page where each employee sees only their own attendance.", "workforce", True),
     ]
     with conn.cursor() as cur:
         for mod in canonical_modules:
