@@ -157,11 +157,13 @@ class TestMainDashboardRegression(unittest.TestCase):
                 "organization_id": "ORG-001",
                 "branch_id": "BR-01",
                 "shifts": [{"id": 1, "name": "Day"}],
+                "assignments": [{"user_id": 26, "shift_id": 3}],
             },
         }
         response = self.client.get("/api/edge/shifts", headers={"X-Branch-Key": "QE-TEST-KEY"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["shifts"][0]["name"], "Day")
+        self.assertEqual(response.get_json()["assignments"][0]["shift_id"], 3)
         self.assertIn("/api/integration/shifts?", relay.call_args.args[0])
 
     @patch("app.query_local_dashboard")
@@ -714,6 +716,12 @@ class TestMainDashboardRegression(unittest.TestCase):
         self.assertIsNotNone(created_org.get("id"))
         self.assertEqual(created_org.get("name"), new_org_payload["name"])
         self.assertRegex(created_org["branches"][0]["tokenKey"], r"^QE-[A-F0-9]{64}$")
+        detail = self.client.get(f"/api/organizations/{created_org['id']}")
+        self.assertEqual(detail.status_code, 200)
+        licensed = detail.get_json().get("modules") or []
+        self.assertIn("payroll", licensed)
+        self.assertIn("attendance", licensed)
+        self.assertIn("shifts", licensed)
 
         # Fetch organizations list
         get_res = self.client.get("/api/organizations")

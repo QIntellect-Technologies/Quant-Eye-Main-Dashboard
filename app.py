@@ -1554,11 +1554,15 @@ def get_edge_shifts():
         or not isinstance(local_data.get("shifts"), list)
     ):
         return jsonify({"success": False, "error": "Shift binding is invalid", "failed_hop": "local"}), 502
+    assignments = local_data.get("assignments") or []
+    if not isinstance(assignments, list):
+        return jsonify({"success": False, "error": "Shift binding is invalid", "failed_hop": "local"}), 502
     return jsonify({
         "success": True,
         "organization_id": organization_id,
         "branch_id": branch_id,
         "shifts": local_data["shifts"],
+        "assignments": assignments,
         "count": len(local_data["shifts"]),
     }), 200
 
