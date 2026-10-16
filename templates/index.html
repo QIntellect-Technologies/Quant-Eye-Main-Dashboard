@@ -666,7 +666,8 @@
         const url=existing?`/api/organizations/${encodeURIComponent(existing)}`:"/api/organizations";
         const method=existing?"PUT":"POST";
         const res=await fetch(url,{method,headers:{"Content-Type":"application/json"},body:JSON.stringify(orgRecord)});
-        if(!res.ok)throw new Error("HTTP "+res.status);
+        const result=await res.json().catch(()=>({}));
+        if(!res.ok)throw new Error(result.error||("HTTP "+res.status));
         record("Organization "+(existing?"updated: ":"created: ")+orgRecord.name,orgRecord.id);
         await reloadData();
         closeModal();

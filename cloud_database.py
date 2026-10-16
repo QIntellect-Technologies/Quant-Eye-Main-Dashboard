@@ -326,6 +326,10 @@ def init_cloud_db(schema_sql_path: Optional[str] = None) -> bool:
                 cur.execute(ddl)
             except Exception as ddl_error:
                 logger.warning("cloud_schema.sql apply continued after: %s", ddl_error)
+            cur.execute("ALTER TABLE branches ADD COLUMN IF NOT EXISTS contact_name VARCHAR(120) DEFAULT '';")
+            cur.execute("ALTER TABLE branches ADD COLUMN IF NOT EXISTS contact_phone VARCHAR(40) DEFAULT '';")
+            cur.execute("ALTER TABLE branches ADD COLUMN IF NOT EXISTS contact_role VARCHAR(80) DEFAULT '';")
+            cur.execute("ALTER TABLE branches ADD COLUMN IF NOT EXISTS contact_email VARCHAR(254) DEFAULT '';")
         logger.info("Successfully executed cloud_schema.sql DDL.")
 
         # Seed Module Catalog
@@ -542,6 +546,34 @@ def delete_organization(org_id: str, user_context: Optional[CloudUser] = None) -
         return True
 
 # --- Branches ---
+def update_organization_profile(
+    org_id: str,
+    name: Optional[str] = None,
+    industry: Optional[str] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    address: Optional[str] = None,
+    status: Optional[str] = None,
+    user_context: Optional[CloudUser] = None,
+) -> None:
+    """Update the company profile the control center already shows."""
+    with tenant_context(user=user_context, org_id=org_id, is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute(
+            """
+            UPDATE organizations
+               SET name = COALESCE(%s, name),
+                   industry = COALESCE(%s, industry),
+                   email = COALESCE(%s, email),
+                   phone = COALESCE(%s, phone),
+                   address = COALESCE(%s, address),
+                   status = COALESCE(%s, status),
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE id = %s
+            """,
+            (name, industry, email, phone, address, status, org_id),
+        )
+
+
 def create_branch(
     org_id: str,
     branch_id: str,
@@ -552,12 +584,19 @@ def create_branch(
     grace_days: int = 0,
     employee_count: int = 0,
     token_key: Optional[str] = None,
+    contact_name: str = "",
+    contact_phone: str = "",
+    contact_role: str = "",
+    contact_email: str = "",
     user_context: Optional[CloudUser] = None
 ) -> Dict[str, Any]:
     with tenant_context(user=user_context, org_id=org_id) as cur:
         cur.execute("""
-            INSERT INTO branches (id, organization_id, name, city, address, access, grace_days, employee_count, token_key)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO branches (
+                id, organization_id, name, city, address, access, grace_days, employee_count, token_key,
+                contact_name, contact_phone, contact_role, contact_email
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (organization_id, id) DO UPDATE SET
                 name = EXCLUDED.name,
                 city = EXCLUDED.city,
@@ -565,10 +604,17 @@ def create_branch(
                 access = EXCLUDED.access,
                 grace_days = EXCLUDED.grace_days,
                 employee_count = EXCLUDED.employee_count,
-                token_key = EXCLUDED.token_key,
+                token_key = COALESCE(NULLIF(EXCLUDED.token_key, ''), branches.token_key),
+                contact_name = COALESCE(NULLIF(EXCLUDED.contact_name, ''), branches.contact_name),
+                contact_phone = COALESCE(NULLIF(EXCLUDED.contact_phone, ''), branches.contact_phone),
+                contact_role = COALESCE(NULLIF(EXCLUDED.contact_role, ''), branches.contact_role),
+                contact_email = COALESCE(NULLIF(EXCLUDED.contact_email, ''), branches.contact_email),
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *;
-        """, (branch_id, org_id, name, city, address, access, grace_days, employee_count, token_key))
+        """, (
+            branch_id, org_id, name, city, address, access, grace_days, employee_count, token_key,
+            contact_name, contact_phone, contact_role, contact_email,
+        ))
         row = cur.fetchone()
         return dict(row)
 

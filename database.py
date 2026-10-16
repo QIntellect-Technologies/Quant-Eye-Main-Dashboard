@@ -516,6 +516,30 @@ def _postgres_control_plane_ready() -> bool:
     return bool(_HAS_CLOUD_DB and cloud_db is not None and cloud_db.postgres_is_configured())
 
 
+def _sqlite_branch_contacts(org_id: str) -> Dict[str, Dict[str, str]]:
+    """Contacts saved with the branch, keyed by branch id."""
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """SELECT branch_id, name, phone, role, email
+                     FROM branch_contacts
+                    WHERE organization_id = ? AND is_primary = 1
+                    ORDER BY id""",
+                (org_id,),
+            ).fetchall()
+    except Exception:
+        return {}
+    contacts = {}
+    for row in rows:
+        contacts[str(row["branch_id"])] = {
+            "name": row["name"] or "",
+            "phone": row["phone"] or "",
+            "role": row["role"] or "",
+            "email": row["email"] or "",
+        }
+    return contacts
+
+
 def _decorate_organization_urls(org_dict: Dict[str, Any]) -> Dict[str, Any]:
     org_id = str(org_dict.get("id") or "")
     name = str(org_dict.get("name") or "")
@@ -554,6 +578,7 @@ def _organization_from_postgres(org_id: str) -> Optional[Dict[str, Any]]:
         org_dict = dict(row)
         modules = cloud_db.get_organization_modules(org_id, user_context=None) or []
         org_dict["modules"] = [m.get("module_id") for m in modules if m.get("is_enabled")]
+        saved_contacts = _sqlite_branch_contacts(org_id)
         branches = []
         for branch in cloud_db.list_branches(org_id, user_context=None) or []:
             b_dict = dict(branch)
@@ -562,6 +587,15 @@ def _organization_from_postgres(org_id: str) -> Optional[Dict[str, Any]]:
             b_dict["tokenKey"] = b_dict.get("token_key") or ""
             b_dict["tokenExpiresAt"] = b_dict.get("token_expires_at") or ""
             b_dict["access"] = b_dict.get("access") or "Active"
+            contact = {
+                "name": str(b_dict.get("contact_name") or "").strip(),
+                "phone": str(b_dict.get("contact_phone") or "").strip(),
+                "role": str(b_dict.get("contact_role") or "").strip(),
+                "email": str(b_dict.get("contact_email") or "").strip(),
+            }
+            if not contact["name"]:
+                contact = saved_contacts.get(str(b_dict.get("id") or "")) or contact
+            b_dict["contact"] = contact
             branches.append(b_dict)
         org_dict["branches"] = branches
         licenses = cloud_db.get_organization_licenses(org_id, user_context=None) or []
@@ -774,13 +808,18 @@ def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
             b_list = branches_data if branches_data else [{'id': 'BR-01', 'name': 'Main Branch', 'city': '', 'address': address}]
             for b in b_list:
                 b_id = b.get('id', 'BR-01')
+                b_contact = b.get('contact') or {}
                 cloud_db.create_branch(
                     org_id=org_id,
                     branch_id=b_id,
                     name=b.get('name', 'Main Branch'),
                     city=b.get('city', ''),
                     address=b.get('address', address),
-                    token_key=branch_token_keys[b_id]
+                    token_key=branch_token_keys[b_id],
+                    contact_name=str(b_contact.get('name') or ''),
+                    contact_phone=str(b_contact.get('phone') or ''),
+                    contact_role=str(b_contact.get('role') or ''),
+                    contact_email=str(b_contact.get('email') or ''),
                 )
             for mid in selected_modules:
                 cloud_db.set_organization_module(org_id, mid, is_enabled=True)
@@ -797,6 +836,46 @@ def get_module_catalog() -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM module_catalog ORDER BY sort_order ASC")
         return [dict(r) for r in cursor.fetchall()]
+
+def _sync_organization_update_to_postgres(org_id: str, data: Dict[str, Any]) -> None:
+    """Keep the live company record, modules, and branch contact in Postgres."""
+    if not _postgres_control_plane_ready():
+        return
+    cloud_db.update_organization_profile(
+        org_id,
+        name=data.get('name'),
+        industry=data.get('industry'),
+        email=data.get('email'),
+        phone=data.get('phone'),
+        address=data.get('address'),
+        status=data.get('status'),
+    )
+    if 'modules' in data:
+        selected = {str(module).strip().lower() for module in (data.get('modules') or [])}
+        for module in cloud_db.list_module_catalog() or []:
+            module_id = str(module.get('id') or '').strip()
+            if module_id:
+                cloud_db.set_organization_module(org_id, module_id, is_enabled=module_id in selected)
+    for branch in data.get('branches') or []:
+        if not isinstance(branch, dict):
+            continue
+        contact = branch.get('contact') or {}
+        cloud_db.create_branch(
+            org_id=org_id,
+            branch_id=branch.get('id') or 'BR-01',
+            name=branch.get('name') or 'Main Branch',
+            city=branch.get('city') or '',
+            address=branch.get('address') or '',
+            access=branch.get('access') or 'Active',
+            grace_days=int(branch.get('graceDays') or 0),
+            employee_count=int(branch.get('employeeCount') or 0),
+            token_key=branch.get('tokenKey') or '',
+            contact_name=str(contact.get('name') or ''),
+            contact_phone=str(contact.get('phone') or ''),
+            contact_role=str(contact.get('role') or ''),
+            contact_email=str(contact.get('email') or ''),
+        )
+
 
 def update_organization(org_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update an existing organization, its modules, branches, branding, and license in persistent storage."""
@@ -890,19 +969,43 @@ def update_organization(org_id: str, data: Dict[str, Any]) -> Optional[Dict[str,
                 # Update contact
                 contact = b.get('contact')
                 if contact:
-                    cursor.execute('''
-                        INSERT INTO branch_contacts (organization_id, branch_id, name, phone, role, email)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(id) DO NOTHING
-                    ''', (org_id, b_id, contact.get('name', 'Manager'), contact.get('phone', ''), contact.get('role', 'Branch Manager'), contact.get('email', '')))
+                    contact_name = contact.get('name') or 'Manager'
+                    contact_phone = contact.get('phone') or ''
+                    contact_role = contact.get('role') or 'Branch Manager'
+                    contact_email = contact.get('email') or ''
+                    cursor.execute(
+                        """SELECT id FROM branch_contacts
+                            WHERE organization_id = ? AND branch_id = ? AND is_primary = 1
+                            ORDER BY id LIMIT 1""",
+                        (org_id, b_id),
+                    )
+                    existing_contact = cursor.fetchone()
+                    if existing_contact:
+                        cursor.execute(
+                            """UPDATE branch_contacts
+                                  SET name = ?, phone = ?, role = ?, email = ?, updated_at = CURRENT_TIMESTAMP
+                                WHERE id = ?""",
+                            (contact_name, contact_phone, contact_role, contact_email, existing_contact['id']),
+                        )
+                    else:
+                        cursor.execute(
+                            """INSERT INTO branch_contacts (organization_id, branch_id, name, phone, role, email)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (org_id, b_id, contact_name, contact_phone, contact_role, contact_email),
+                        )
 
-        # Reconcile license if provided
+        # Reconcile license if provided. Keep the key this company already has.
         if 'tokenKey' in data or 'tokenExpiresAt' in data:
-            tok_id = data.get('tokenId') or f"TOK-{org_id}"
             tok_key = data.get('tokenKey') or f"KEY-{org_id}"
             tok_start = data.get('tokenStartedAt') or ""
             tok_exp = data.get('tokenExpiresAt') or ""
             tok_days = int(data.get('tokenValidityDays', 30) or 30)
+            cursor.execute(
+                "SELECT id FROM organization_licenses WHERE organization_id = ? OR token_key = ? ORDER BY created_at DESC LIMIT 1",
+                (org_id, tok_key),
+            )
+            existing_license = cursor.fetchone()
+            tok_id = (existing_license['id'] if existing_license else None) or data.get('tokenId') or f"TOK-{org_id}"
             cursor.execute('''
                 INSERT INTO organization_licenses (id, organization_id, token_key, started_at, expires_at, validity_days, status, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, 'Valid', CURRENT_TIMESTAMP)
@@ -933,6 +1036,7 @@ def update_organization(org_id: str, data: Dict[str, Any]) -> Optional[Dict[str,
 
         conn.commit()
 
+    _sync_organization_update_to_postgres(org_id, data)
     return get_organization_by_id(org_id)
 
 def delete_organization(org_id: str) -> bool:
