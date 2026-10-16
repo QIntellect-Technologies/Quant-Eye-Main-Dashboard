@@ -538,7 +538,10 @@ def public_mobile_module(org_id):
         logger.exception("Mobile module lookup failed")
         return jsonify({"mobile": False}), 200
     modules = [str(module).strip().lower() for module in ((org or {}).get("modules") or [])]
-    return jsonify({"mobile": "mobile" in modules})
+    return jsonify({
+        "mobile": "mobile" in modules,
+        "name": str((org or {}).get("name") or "").strip(),
+    })
 
 
 @app.get("/api/modules")
