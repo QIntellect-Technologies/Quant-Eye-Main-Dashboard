@@ -696,6 +696,39 @@ def get_all_organizations() -> List[Dict[str, Any]]:
             result.append(_decorate_organization_urls(org_dict))
         return result
 
+def find_organization_for_mobile(company_key: str) -> Optional[Dict[str, Any]]:
+    """Resolve the phone company field to one organization. Ambiguous names match nobody."""
+    import re as _re
+    raw = str(company_key or "").strip()
+    if not raw:
+        return None
+    lower = raw.lower()
+    compact = _re.sub(r"[^a-z0-9]", "", lower)
+    org = get_organization_by_id(raw)
+    if org:
+        return org
+    if _postgres_control_plane_ready() and cloud_db is not None:
+        try:
+            row = cloud_db.get_organization_by_portal_slug(lower)
+            if row:
+                return get_organization_by_id(row["id"]) or row
+            row = cloud_db.get_organization_by_name(raw)
+            if row:
+                return get_organization_by_id(row["id"]) or row
+        except Exception as error:
+            logger.warning("Mobile company lookup on Postgres failed: %s", error)
+    named = []
+    for item in get_all_organizations():
+        slug = str(item.get("portal_slug") or "").strip().lower()
+        name = str(item.get("name") or "").strip().lower()
+        name_compact = _re.sub(r"[^a-z0-9]", "", name)
+        if slug == lower or name == lower or (compact and name_compact == compact):
+            named.append(item)
+    if len(named) == 1:
+        return named[0]
+    return None
+
+
 def get_organization_by_id(org_id: str) -> Optional[Dict[str, Any]]:
     """Retrieve a single organization by ID."""
     orgs = [o for o in get_all_organizations() if o['id'] == org_id]

@@ -493,6 +493,21 @@ def get_organization(org_id: str, user_context: Optional[CloudUser] = None) -> O
         row = cur.fetchone()
         return dict(row) if row else None
 
+def get_organization_by_name(name: str) -> Optional[Dict[str, Any]]:
+    label = str(name or "").strip()
+    if not label:
+        return None
+    with tenant_context(is_platform_admin=True, enforce_rls=False) as cur:
+        cur.execute(
+            "SELECT * FROM organizations WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s));",
+            (label,),
+        )
+        rows = cur.fetchall() or []
+    if len(rows) == 1:
+        return dict(rows[0])
+    return None
+
+
 def get_organization_by_portal_slug(portal_slug: str) -> Optional[Dict[str, Any]]:
     slug = str(portal_slug or "").strip().lower()
     if not slug:
