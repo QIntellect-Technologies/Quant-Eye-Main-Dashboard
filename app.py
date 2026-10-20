@@ -468,8 +468,12 @@ def dashboard():
 
 @app.get("/attendance-report")
 def attendance_report_page():
-    """Serve the existing Attendance Report page connected to Cloud PostgreSQL."""
-    return render_template("attendance_report.html")
+    """Attendance reports belong in the Client Portal; redirect cleanly."""
+    org_id = request.args.get("organization_id", "").strip()
+    branch_id = request.args.get("branch_id", "").strip()
+    if org_id:
+        return redirect(f"/client/portal?organization_id={org_id}&branch_id={branch_id}", code=302)
+    return redirect("/client/portal", code=302)
 
 
 @app.get("/client/portal")
