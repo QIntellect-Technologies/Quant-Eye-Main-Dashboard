@@ -545,6 +545,7 @@ def public_mobile_module(org_id):
     return jsonify({
         "mobile": "mobile" in modules,
         "name": str((org or {}).get("name") or "").strip(),
+        "modules": modules,
     })
 
 
