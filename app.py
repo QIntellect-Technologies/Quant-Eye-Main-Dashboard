@@ -536,13 +536,53 @@ def api_dashboard_stats():
 @app.get("/api/public/mobile-module/<org_id>")
 def public_mobile_module(org_id):
     """Tell the employee phone page whether this organization bought Mobile App."""
-    try:
-        org = db.get_organization_by_id(str(org_id or "").strip())
-    except Exception:
-        logger.exception("Mobile module lookup failed")
-        return jsonify({"mobile": False}), 200
+    clean_id = str(org_id or "").strip()
+    org = None
+    if _postgres_ready() and clean_id:
+        try:
+            conn = cloud_db.get_raw_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, name, portal_slug FROM organizations
+                        WHERE id = %s OR LOWER(id) = LOWER(%s) OR LOWER(COALESCE(portal_slug, '')) = LOWER(%s)
+                        LIMIT 1
+                        """,
+                        (clean_id, clean_id, clean_id)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        resolved_id = str(row[0]).strip()
+                        org_name = str(row[1]).strip() if row[1] else ""
+                        cur.execute(
+                            """
+                            SELECT module_id FROM organization_modules
+                            WHERE (organization_id = %s OR LOWER(organization_id) = LOWER(%s))
+                              AND (is_enabled IS TRUE OR is_enabled IS NULL)
+                            """,
+                            (resolved_id, resolved_id)
+                        )
+                        mods = [str(r[0]).strip().lower() for r in cur.fetchall() if r and r[0]]
+                        org = {"id": resolved_id, "name": org_name, "modules": mods}
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("Cloud DB organization lookup failed: %s", e)
+
+    if not org:
+        try:
+            org = db.get_organization_by_id(clean_id)
+        except Exception:
+            logger.exception("Mobile module lookup failed")
+            return jsonify({"found": False, "mobile": False, "name": "", "modules": []}), 200
+
+    if not org:
+        return jsonify({"found": False, "mobile": False, "name": "", "modules": []}), 200
+
     modules = [str(module).strip().lower() for module in ((org or {}).get("modules") or [])]
     return jsonify({
+        "found": True,
         "mobile": "mobile" in modules,
         "name": str((org or {}).get("name") or "").strip(),
         "modules": modules,

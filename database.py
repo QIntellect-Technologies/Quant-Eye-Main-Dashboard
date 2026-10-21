@@ -730,9 +730,17 @@ def find_organization_for_mobile(company_key: str) -> Optional[Dict[str, Any]]:
 
 
 def get_organization_by_id(org_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieve a single organization by ID."""
-    orgs = [o for o in get_all_organizations() if o['id'] == org_id]
-    return orgs[0] if orgs else None
+    """Retrieve a single organization by ID or portal_slug."""
+    if not org_id:
+        return None
+    target = str(org_id).strip()
+    target_lower = target.lower()
+    for o in get_all_organizations():
+        if str(o.get('id', '')).strip() == target or str(o.get('id', '')).strip().lower() == target_lower:
+            return o
+        if str(o.get('portal_slug', '')).strip().lower() == target_lower:
+            return o
+    return None
 
 def create_organization(data: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new organization in persistent storage."""
